@@ -9,8 +9,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define FOR_UNROLL(n) for (short _i = 0; _i < (n); _i++)
-
 typedef struct {
     int32_t ne00, ne01, ne02, ne03; // k dims: [S, H, T]
     int32_t nb02;                    // k stride between tokens (in floats)

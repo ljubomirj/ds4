@@ -1178,6 +1178,9 @@ static const char *ds4_metal_source =
 "#define QK4_NL 32\n"
 "#define QK_K  256\n"
 "\n"
+"// F16 t4 dequantize (needed by ds4 dense.metal matvec-ext templates)\n"
+"static void dequantize_f16_t4(device const half4 * src, short il, thread float4 & reg) { reg = float4(src[il]); }\n"
+"\n"
 "// IQ4_NL: 4.5 bpw, 32 elements per block, 18 bytes\n"
 "struct block_iq4_nl {\n"
 "    half d;\n"
@@ -1218,15 +1221,19 @@ static NSString *ds4_metal_full_source(void) {
      * run can swap one source file without changing the executable.
      */
     NSArray<NSArray<NSString *> *> *required_sources = @[
+        @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
+        @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
+        @[@"DS4_METAL_DSV4_KV_SOURCE",    @"metal/dsv4_kv.metal"],
         @[@"DS4_METAL_DSV4_ROPE_SOURCE",  @"metal/dsv4_rope.metal"],
         @[@"DS4_METAL_DSV4_MISC_SOURCE",  @"metal/dsv4_misc.metal"],
         @[@"DS4_METAL_ARGSORT_SOURCE",    @"metal/argsort.metal"],
         @[@"DS4_METAL_CPY_SOURCE",        @"metal/cpy.metal"],
         @[@"DS4_METAL_CONCAT_SOURCE",     @"metal/concat.metal"],
         @[@"DS4_METAL_GET_ROWS_SOURCE",   @"metal/get_rows.metal"],
+        @[@"DS4_METAL_REPEAT_SOURCE",     @"metal/repeat.metal"],
         @[@"DS4_METAL_SUM_ROWS_SOURCE",   @"metal/sum_rows.metal"],
         @[@"DS4_METAL_SOFTMAX_SOURCE",    @"metal/softmax.metal"],
         @[@"DS4_METAL_GLU_SOURCE",        @"metal/glu.metal"],
@@ -14583,12 +14590,12 @@ static id<MTLComputePipelineState> l26f_metal_gla_pipeline(uint32_t head_dim) {
 }
 
 int l26f_metal_gla(
-    l26f_metal_tensor       *output,
-    l26f_metal_tensor       *state,
-    const l26f_metal_tensor *k,
-    const l26f_metal_tensor *v,
-    const l26f_metal_tensor *q,
-    const l26f_metal_tensor *g,
+    ds4_metal_tensor       *output,
+    ds4_metal_tensor       *state,
+    const ds4_metal_tensor *k,
+    const ds4_metal_tensor *v,
+    const ds4_metal_tensor *q,
+    const ds4_metal_tensor *g,
     uint32_t n_tokens,
     uint32_t n_seqs,
     uint32_t head_dim,
@@ -14694,9 +14701,12 @@ int l26f_metal_gla(
 // L26F: IQ4_NL matvec dispatch
 // =========================================================================
 
+// Forward declaration for pipeline cache helper
+static id<MTLComputePipelineState> l26f_metal_get_cached_pipeline(const char *fname);
+
 int l26f_metal_matvec_iq4_nl(
-    l26f_metal_tensor       *dst,
-    const l26f_metal_tensor *src1,
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src1,
     const void              *model_map,
     uint64_t                 model_size,
     uint64_t                 weight_offset,
@@ -14708,7 +14718,7 @@ int l26f_metal_matvec_iq4_nl(
     if ((in_dim & 31u) != 0 || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
 
     const uint64_t blocks_per_row = in_dim / 32u;
-    const uint64_t row_bytes = blocks_per_row * sizeof(block_iq4_nl); // 18 bytes per block
+    const uint64_t row_bytes = blocks_per_row * 18; // sizeof(block_iq4_nl) = 18 bytes
     const uint64_t weight_bytes = out_dim * row_bytes;
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
 
@@ -14831,8 +14841,8 @@ static id<MTLComputePipelineState> l26f_metal_get_cached_pipeline(const char *fn
 // =========================================================================
 
 int l26f_metal_matvec_quant(
-    l26f_metal_tensor       *dst,
-    const l26f_metal_tensor *src1,
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src1,
     const void              *model_map,
     uint64_t                 model_size,
     uint64_t                 weight_offset,

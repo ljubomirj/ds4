@@ -13,8 +13,14 @@ l26f_gguf.o: l26f_gguf.c l26f.h
 l26f_metal.o: l26f_metal.m l26f_metal.h
 	$(CC) $(OBJCFLAGS) -c -o $@ l26f_metal.m
 
-test_l26f: test_l26f.o l26f_gguf.o
-	$(CC) $(CFLAGS) -o $@ test_l26f.o l26f_gguf.o $(LDLIBS)
+l26f.o: l26f.c l26f.h l26f_metal.h
+	$(CC) $(CFLAGS) -c -o $@ l26f.c
+
+test_l26f: test_l26f.o l26f.o l26f_gguf.o l26f_metal.o
+	$(CC) $(CFLAGS) -o $@ test_l26f.o l26f.o l26f_gguf.o l26f_metal.o $(LDLIBS)
+
+test_l26f.o: test_l26f.c l26f.h
+	$(CC) $(CFLAGS) -c -o $@ test_l26f.c
 
 test: test_l26f
 	./test_l26f

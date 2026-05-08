@@ -3,26 +3,27 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "ds4_metal.h"
 
 // Opaque device tensor
-typedef struct l26f_metal_tensor l26f_metal_tensor;
+typedef struct ds4_metal_tensor ds4_metal_tensor;
 
 // Device lifecycle
 int  l26f_metal_init(void);
 void l26f_metal_cleanup(void);
 
 // Tensor management
-l26f_metal_tensor *l26f_metal_tensor_alloc(uint64_t bytes);
-l26f_metal_tensor *l26f_metal_tensor_view(const l26f_metal_tensor *base,
+ds4_metal_tensor *ds4_metal_tensor_alloc(uint64_t bytes);
+ds4_metal_tensor *ds4_metal_tensor_view(const ds4_metal_tensor *base,
                                            uint64_t offset, uint64_t bytes);
-void l26f_metal_tensor_free(l26f_metal_tensor *tensor);
-uint64_t l26f_metal_tensor_bytes(const l26f_metal_tensor *tensor);
-void *l26f_metal_tensor_contents(l26f_metal_tensor *tensor);
-int  l26f_metal_tensor_write(l26f_metal_tensor *tensor, uint64_t offset,
+void ds4_metal_tensor_free(ds4_metal_tensor *tensor);
+uint64_t ds4_metal_tensor_bytes(const ds4_metal_tensor *tensor);
+void *ds4_metal_tensor_contents(ds4_metal_tensor *tensor);
+int  ds4_metal_tensor_write(ds4_metal_tensor *tensor, uint64_t offset,
                               const void *data, uint64_t bytes);
-int  l26f_metal_tensor_read(const l26f_metal_tensor *tensor, uint64_t offset,
+int  ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset,
                              void *data, uint64_t bytes);
-int  l26f_metal_tensor_fill(l26f_metal_tensor *tensor, float value);
+int  ds4_metal_tensor_fill(ds4_metal_tensor *tensor, float value);
 
 // Model mapping (zero-copy from mmap)
 int  l26f_metal_set_model_map(const void *model_map, uint64_t model_size);
@@ -43,12 +44,12 @@ int  l26f_metal_synchronize(void);
 //   Layout: first S*H*n_tokens elements = attention output
 //           then  S*S*H*n_seqs elements = updated recurrent state
 int l26f_metal_gla(
-    l26f_metal_tensor       *output,       // [S*H, n_tokens + S*S*H*n_seqs]
-    l26f_metal_tensor       *state,        // [S*S*H, n_seqs] recurrent state (in: prev, out: updated)
-    const l26f_metal_tensor *k,
-    const l26f_metal_tensor *v,
-    const l26f_metal_tensor *q,
-    const l26f_metal_tensor *g,
+    ds4_metal_tensor       *output,       // [S*H, n_tokens + S*S*H*n_seqs]
+    ds4_metal_tensor       *state,        // [S*S*H, n_seqs] recurrent state (in: prev, out: updated)
+    const ds4_metal_tensor *k,
+    const ds4_metal_tensor *v,
+    const ds4_metal_tensor *q,
+    const ds4_metal_tensor *g,
     uint32_t n_tokens,
     uint32_t n_seqs,
     uint32_t head_dim,
@@ -58,8 +59,8 @@ int l26f_metal_gla(
 // Quantized matvec (decode): routes to correct kernel by GGUF weight type
 // weight_type: 1=F16, 8=Q8_0, 13=Q5_K, 14=Q6_K, 20=IQ4_NL
 int l26f_metal_matvec_quant(
-    l26f_metal_tensor       *dst,
-    const l26f_metal_tensor *src1,
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src1,
     const void              *model_map,
     uint64_t                 model_size,
     uint64_t                 weight_offset,
@@ -70,8 +71,8 @@ int l26f_metal_matvec_quant(
 
 // RMS Norm (with weight)
 int l26f_metal_rms_norm_weight(
-    l26f_metal_tensor       *out,
-    const l26f_metal_tensor *x,
+    ds4_metal_tensor       *out,
+    const ds4_metal_tensor *x,
     const void              *model_map,
     uint64_t                 model_size,
     uint64_t                 weight_offset,
@@ -80,27 +81,27 @@ int l26f_metal_rms_norm_weight(
 
 // SiLU activation
 int l26f_metal_silu(
-    l26f_metal_tensor       *out,
-    const l26f_metal_tensor *x,
+    ds4_metal_tensor       *out,
+    const ds4_metal_tensor *x,
     uint32_t                 n);
 
 // Element-wise multiply
 int l26f_metal_mul(
-    l26f_metal_tensor       *out,
-    const l26f_metal_tensor *a,
-    const l26f_metal_tensor *b,
+    ds4_metal_tensor       *out,
+    const ds4_metal_tensor *a,
+    const ds4_metal_tensor *b,
     uint32_t                 n);
 
 // Element-wise add
 int l26f_metal_add(
-    l26f_metal_tensor       *out,
-    const l26f_metal_tensor *a,
-    const l26f_metal_tensor *b,
+    ds4_metal_tensor       *out,
+    const ds4_metal_tensor *a,
+    const ds4_metal_tensor *b,
     uint32_t                 n);
 
 // Token embedding lookup
 int l26f_metal_embed_tokens(
-    l26f_metal_tensor       *out,
+    ds4_metal_tensor       *out,
     const uint32_t          *tokens,
     const void              *model_map,
     uint64_t                 model_size,
