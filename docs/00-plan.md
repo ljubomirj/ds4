@@ -80,50 +80,30 @@ From llama.cpp:
 
 ## Implementation Plan
 
-### Phase 1: Weight Loading
-- [ ] GGUF loader for the specific quantization mix (F32 + IQ4_NL + Q5_K + Q6_K + Q8_0)
-- [ ] Hardcoded tensor map for Ling-2.6-flash
-- [ ] Direct Metal allocation (skip llama.cpp's GGML tensor system)
-- [ ] Verify all 540 tensors load correctly
+### Phase 1: Weight Loading — DONE
+- [x] GGUF loader with metadata parsing (l26f_gguf.c)
+- [x] Tensor lookup by name (l26f_model_find_tensor)
+- [x] All 540 tensors verified: F32=228, Q5_K=106, Q6_K=6, IQ4_NL=199, Q8_0=1
+- [x] MLA/GLA layer detection from head_count_kv metadata
 
-### Phase 2: Metal Layer — IN PROGRESS
-- [x] GLA kernel ported from llama.cpp (metal/l26f_gla.metal)
-- [x] GLA dispatch function (l26f_metal.m)
+### Phase 2: Metal Layer — DONE
+- [x] GLA kernel ported from llama.cpp (metal/l26f_gla.metal) + dispatch
 - [x] IQ4_NL/Q5_K/Q6_K block structs + dequant helpers (metal/l26f_dense.metal)
-- [x] IQ4_NL single-token matvec kernel (metal/l26f_dense.metal)
-- [x] IQ4_NL small-batch matvec instantiations
-- [x] IQ4_NL matvec dispatch function (l26f_metal.m)
-- [ ] Q5_K matvec kernel + dispatch
-- [ ] Q6_K matvec kernel + dispatch
-- [x] Reusable ds4 kernels: norms, SiLU, SwiGLU, bin ops, cpy, embedding, softmax, RoPE, MoE router, argsort, set_rows
+- [x] IQ4_NL, Q5_K, Q6_K single-token matvec kernels + dispatch
+- [x] Generic quantized matvec router (l26f_metal_matvec_quant)
+- [x] 11 reusable ds4 kernels: norms, activations, bin ops, embeddings, softmax, RoPE
 - [ ] MLA kernel (DeepSeek2-style compressed attention)
-- [ ] MoE expert matmul with IQ4_NL/Q5_K/Q6_K weights
+- [ ] MoE expert matmul with IQ4_NL weights
 
-### Phase 2: GLA Forward Pass
-- [ ] Port GLA Metal kernel from llama.cpp (non-fused, with keep_intermediates)
-- [ ] GLA recurrent state management (S state per layer per sequence)
-- [ ] Decay slope computation (hardcoded Ling-2.6 formula)
-- [ ] Gating computation (linear + sigmoid)
-- [ ] Output projection
-
-### Phase 3: MLA Forward Pass
-- [ ] MLA compressed KV cache (ring buffer, per-layer)
-- [ ] Q computation: wq_a → norm → wq_b → reshape → RoPE
-- [ ] KV computation: wkv_a → norm → split into kv_cmpr + k_pe
-- [ ] Direct dot-product attention (Q pre-expanded, KV compressed)
-- [ ] V decompression post-attention (wv_b)
-- [ ] Output projection
-
-### Phase 4: MoE Forward Pass
-- [ ] Router: ffn_gate_inp → expert probabilities + bias
-- [ ] Group selection: 8 groups, top-4, select experts from top groups
-- [ ] Expert FFN: routed experts (SwitchGLU) + shared expert
-- [ ] Expert weighting + combination
-
-### Phase 5: Caching (The Big One)
-- [ ] Sliding window ring buffer for MLA KV (ds4-style)
-- [ ] GLA recurrent state per layer — snapshot at checkpoint boundaries
-- [ ] Self-contained checkpoint format (tokens + logits + MLA KV + GLA S state)
+### Phase 3: Inference Driver — IN PROGRESS
+- [x] Tensor verification tool
+- [ ] Metal initialization + model map
+- [ ] GLA layer end-to-end (single layer, single token)
+- [ ] Full 32-layer transformer loop
+- [ ] MLA layer forward pass
+- [ ] MoE FFN forward pass
+- [ ] BPE tokenizer
+- [ ] CLI / server
 
 #### Recurrent State Cutoff Strategy
 
