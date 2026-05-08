@@ -159,7 +159,6 @@ static void l26f_parse_tensors(l26f_model *m, l26f_cursor *c) {
 
     m->alignment = 32;
     uint64_t max_alignment = m->alignment - 1;
-    uint64_t pos = (uint64_t)(c->ptr - m->map);
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         l26f_tensor *t = &m->tensors[i];
@@ -167,7 +166,8 @@ static void l26f_parse_tensors(l26f_model *m, l26f_cursor *c) {
         if (!l26f_cursor_u32(c, &t->ndim)) return;
         if (t->ndim > L26F_MAX_DIMS) { l26f_cursor_error(c, "tensor has too many dims"); return; }
         t->elements = 1;
-        for (uint32_t j = 0; j < t->ndim; j++) {
+        uint32_t j;
+        for (j = 0; j < t->ndim; j++) {
             if (!l26f_cursor_u64(c, &t->dim[j])) return;
             t->elements *= t->dim[j];
         }
@@ -184,12 +184,19 @@ static void l26f_parse_tensors(l26f_model *m, l26f_cursor *c) {
             }
         }
 
-        uint64_t aligned = (pos + max_alignment) & ~max_alignment;
-        if (aligned < pos) { l26f_cursor_error(c, "tensor offset overflow"); return; }
-        pos = aligned;
-        t->abs_offset = pos + offset;
+        // Store the GGUF offset; abs_offset will be computed after all entries
+        t->abs_offset = offset;
     }
-    m->tensor_data_pos = pos;
+
+    // Tensor data starts after all entries, aligned to 32 bytes
+    uint64_t pos = (uint64_t)(c->ptr - m->map);
+    uint64_t aligned = (pos + max_alignment) & ~max_alignment;
+    m->tensor_data_pos = aligned;
+
+    // Now apply the proper abs_offset for each tensor
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        m->tensors[i].abs_offset += m->tensor_data_pos;
+    }
 }
 
 // ---- Public API ----

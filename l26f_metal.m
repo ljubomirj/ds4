@@ -434,8 +434,6 @@ static int ds4_metal_map_model_views(
 
     const uint64_t step = max_buffer - overlap;
     uint64_t off = 0;
-            (unsigned long long)mapped_model_size, (unsigned long long)mapped_model_size,
-            (unsigned long long)max_buffer, (unsigned long long)overlap, (unsigned long long)step);
     while (off < mapped_model_size) {
         if (g_model_view_count == DS4_METAL_MAX_MODEL_VIEWS) {
             fprintf(stderr, "ds4: Metal model needs more mapped views than expected\n");
@@ -445,15 +443,10 @@ static int ds4_metal_map_model_views(
         uint64_t view_bytes = mapped_model_size - off;
         if (view_bytes > max_buffer) view_bytes = max_buffer;
 
-                g_model_view_count, (unsigned long long)off, (unsigned long long)view_bytes,
-                (void *)(model_addr + page_model_offset + off));
-        fflush(stderr);
-
         id<MTLBuffer> buffer = [g_device newBufferWithBytesNoCopy:(void *)(model_addr + page_model_offset + off)
                                                            length:(NSUInteger)view_bytes
                                                           options:MTLResourceStorageModeShared
                                                       deallocator:nil];
-        fflush(stderr);
         if (!buffer) {
             fprintf(stderr,
                     "ds4: Metal could not wrap mmaped model view at %.2f GiB, size %.2f GiB\n",
@@ -477,8 +470,6 @@ static int ds4_metal_map_model_views(
         if (off + view_bytes >= mapped_model_size) break;
         off += step;
     }
-
-    fflush(stderr);
 
     const double t_mapped = ds4_metal_now_ms();
     const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
@@ -14643,12 +14634,12 @@ int l26f_metal_gla(
         const uint64_t s_bytes    = (uint64_t)S * S * H * n_seqs * sizeof(float);
         const uint64_t out_bytes  = (tok_stride * T + (uint64_t)S * S * H * n_seqs) * sizeof(float);
 
-        if (ds4_metal_tensor_bytes(k) < k_bytes + k_off ||
-            ds4_metal_tensor_bytes(v) < k_bytes + v_off ||
-            ds4_metal_tensor_bytes(q) < k_bytes + q_off ||
-            ds4_metal_tensor_bytes(g) < k_bytes + g_off ||
-            ds4_metal_tensor_bytes(state) < s_bytes + s_off ||
-            ds4_metal_tensor_bytes(output) < out_bytes + out_off) {
+        if (ds4_metal_tensor_bytes(k) < k_bytes ||
+            ds4_metal_tensor_bytes(v) < k_bytes ||
+            ds4_metal_tensor_bytes(q) < k_bytes ||
+            ds4_metal_tensor_bytes(g) < k_bytes ||
+            ds4_metal_tensor_bytes(state) < s_bytes ||
+            ds4_metal_tensor_bytes(output) < out_bytes) {
             fprintf(stderr, "l26f: GLA tensor size mismatch\n");
             return 0;
         }
@@ -14689,9 +14680,8 @@ int l26f_metal_gla(
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
         ds4_metal_end_compute_encoder(cb, enc);
 
-        if (!ds4_metal_finish_command_buffer(cb, owned, "GLA attention")) return 0;
-
         // Copy final state from tail of output buffer back into state buffer
+        // Do this BEFORE committing — same command buffer
         if (outbuf != sbuf || out_off + (NSUInteger)(tok_stride * T * sizeof(float)) != s_off) {
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             [blit copyFromBuffer:outbuf
@@ -14702,7 +14692,7 @@ int l26f_metal_gla(
             [blit endEncoding];
         }
 
-        return ds4_metal_finish_command_buffer(cb, 0, "GLA finish");
+        return ds4_metal_finish_command_buffer(cb, owned, "GLA attention");
     }
 }
 
