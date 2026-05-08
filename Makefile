@@ -5,7 +5,7 @@ LDLIBS ?= -lm -framework Foundation -framework Metal
 
 .PHONY: all clean test
 
-all: test_l26f
+all: test_l26f test_l26f_multilayer
 
 l26f_gguf.o: l26f_gguf.c l26f.h
 	$(CC) $(CFLAGS) -c -o $@ l26f_gguf.c
@@ -22,8 +22,14 @@ test_l26f: test_l26f.o l26f.o l26f_gguf.o l26f_metal.o
 test_l26f.o: test_l26f.c l26f.h
 	$(CC) $(CFLAGS) -c -o $@ test_l26f.c
 
+test_l26f_multilayer: test_l26f_multilayer.o l26f.o l26f_gguf.o l26f_metal.o
+	$(CC) $(CFLAGS) -o $@ test_l26f_multilayer.o l26f.o l26f_gguf.o l26f_metal.o $(LDLIBS)
+
+test_l26f_multilayer.o: test_l26f_multilayer.c l26f.h l26f_metal.h ds4_metal.h
+	$(CC) $(CFLAGS) -c -o $@ test_l26f_multilayer.c
+
 test: test_l26f
 	./test_l26f
 
 clean:
-	rm -f *.o test_l26f
+	rm -f *.o test_l26f test_l26f_multilayer

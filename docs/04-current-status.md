@@ -1,8 +1,8 @@
 # l26f — Current Status
 
-**Date**: 2026-05-08
+**Date**: 2026-05-08 (evening)
 **Branch**: `l26f` (ljubomirj/l26f fork of antirez/ds4)
-**Model**: Ling-2.6-flash IQ4_NL quality GGUF (58 GB)
+**Model**: Two GGUFs available — see "GGUF Files" section below
 
 ---
 
@@ -39,7 +39,24 @@ This is the only fully verified pipeline so far. It proves:
 
 ---
 
-## Current Blocker: IQ4_NL Block Struct Size Mismatch
+## Current Blocker: ~~IQ4_NL Block Struct Size Mismatch~~ FIXED
+
+Fixed in commit `ad631b6`. The `block_iq4_nl` Metal struct had `uint16_t qs[16]`
+(32 bytes) instead of `uint8_t qs[16]` (16 bytes). Total was 34 bytes instead of
+18. The IQ4_NL kernel was also rewritten, ported from llama.cpp's reference.
+
+Layer 0 full pipeline now works end-to-end with zero NaNs:
+```
+embed → rms_norm → qkv(Q5_K) → gate(Q5_K) → GLA → out_proj(Q5_K) → residual
+→ ffn_rms_norm → ffn_gate(IQ4_NL) → ffn_up(IQ4_NL) → SwiGLU → ffn_down(Q5_K) → residual
+= sum=-258.3, 0 NaNs ✓
+```
+
+### Next Blocker: Multi-layer loop needs MoE FFN
+
+The multi-layer driver (`test_l26f_multilayer.c`) runs layer 0 with dense FFN
+but layers 1-31 all use MoE FFN. The MoE routing + expert matvec is not yet
+implemented. Currently those layers just pass through residual (no FFN).
 
 ### The Problem
 
@@ -261,7 +278,22 @@ IQ4_NL. Always check `tensor->type` before dispatching to a kernel.
 
 ---
 
-## What's Next (Priority Order)
+## GGUF Files
+
+Two distinct files (the "fixed" one is a copy of the 20260505 one, verified by `cmp`):
+
+| File | Size | Q5_K | IQ4_NL | Notes |
+|------|------|------|--------|-------|
+| `.../Ling-2.6-flash-IQ4_NL-bailing_hybrid-20260505-LJ.gguf` | 57 GB | 7 | 304 | Original. attn QKV is IQ4_NL. |
+| `.../Ling-2.6-flash-IQ4_NL-quality-bailing_hybrid-20260508-LJ.gguf` | 58 GB | 106 | 199 | Re-quantized. attn QKV is Q5_K. |
+
+Both are on NVME at `~/NVME_4TB_SSD_GRAUGEAR_Users_ljubomir/llama.cpp/bailing-hybrid/`.
+
+The quality GGUF masks the IQ4_NL bug for attention (Q5_K attn weights) but still
+needs it for FFN. The old GGUF hits IQ4_NL even in the attention path. Either way,
+the IQ4_NL block struct fix is required.
+
+We're using the quality GGUF for now (attn path works with Q5_K).
 
 ### P0: Fix IQ4_NL block struct (unblocks everything)
 
