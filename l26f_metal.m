@@ -434,6 +434,8 @@ static int ds4_metal_map_model_views(
 
     const uint64_t step = max_buffer - overlap;
     uint64_t off = 0;
+            (unsigned long long)mapped_model_size, (unsigned long long)mapped_model_size,
+            (unsigned long long)max_buffer, (unsigned long long)overlap, (unsigned long long)step);
     while (off < mapped_model_size) {
         if (g_model_view_count == DS4_METAL_MAX_MODEL_VIEWS) {
             fprintf(stderr, "ds4: Metal model needs more mapped views than expected\n");
@@ -443,10 +445,15 @@ static int ds4_metal_map_model_views(
         uint64_t view_bytes = mapped_model_size - off;
         if (view_bytes > max_buffer) view_bytes = max_buffer;
 
+                g_model_view_count, (unsigned long long)off, (unsigned long long)view_bytes,
+                (void *)(model_addr + page_model_offset + off));
+        fflush(stderr);
+
         id<MTLBuffer> buffer = [g_device newBufferWithBytesNoCopy:(void *)(model_addr + page_model_offset + off)
                                                            length:(NSUInteger)view_bytes
                                                           options:MTLResourceStorageModeShared
                                                       deallocator:nil];
+        fflush(stderr);
         if (!buffer) {
             fprintf(stderr,
                     "ds4: Metal could not wrap mmaped model view at %.2f GiB, size %.2f GiB\n",
@@ -470,6 +477,8 @@ static int ds4_metal_map_model_views(
         if (off + view_bytes >= mapped_model_size) break;
         off += step;
     }
+
+    fflush(stderr);
 
     const double t_mapped = ds4_metal_now_ms();
     const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
