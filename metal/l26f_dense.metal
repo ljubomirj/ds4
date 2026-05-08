@@ -159,3 +159,67 @@ template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_2")]] kernel mul_mv_ext_iq
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_3")]] kernel mul_mv_ext_iq4_nl_t kernel_mul_mv_ext_q4_f32_disp<3, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_4")]] kernel mul_mv_ext_iq4_nl_t kernel_mul_mv_ext_q4_f32_disp<4, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_5")]] kernel mul_mv_ext_iq4_nl_t kernel_mul_mv_ext_q4_f32_disp<5, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
+
+// ---- Q5_K single-token matvec ----
+kernel void kernel_mul_mv_q5_K_f32(
+    constant ds4_metal_args_mul_mv & args [[buffer(0)]],
+    device const block_q5_K  * src0 [[buffer(1)]],
+    device const float       * src1 [[buffer(2)]],
+    device       float       * dst  [[buffer(3)]],
+    uint   tid[[thread_position_in_grid]])
+{
+    const int r0 = (int)tid;
+    if (r0 >= args.ne01) return;
+
+    const int in  = args.ne00;
+    const int nth = (int)(args.ne01); // use ne01 as thread count for dispatch
+    float sum = 0.0f;
+
+    device const block_q5_K * blocks = src0 + r0 * (in / 256);
+    for (int ib = 0; ib < (int)(in / 256); ib++) {
+        for (short il = 0; il < 16; il++) {
+            float4x4 reg;
+            dequantize_q5_K(&blocks[ib], il, reg);
+            int base = ib * 256 + il * 16;
+            for (int j = 0; j < 4; j++) {
+                for (int k = 0; k < 4; k++) {
+                    int idx = base + j * 4 + k;
+                    if (idx < in) sum += reg[j][k] * src1[idx];
+                }
+            }
+        }
+    }
+    dst[r0] = sum;
+}
+
+// ---- Q6_K single-token matvec ----
+kernel void kernel_mul_mv_q6_K_f32(
+    constant ds4_metal_args_mul_mv & args [[buffer(0)]],
+    device const block_q6_K  * src0 [[buffer(1)]],
+    device const float       * src1 [[buffer(2)]],
+    device       float       * dst  [[buffer(3)]],
+    uint   tid[[thread_position_in_grid]])
+{
+    const int r0 = (int)tid;
+    if (r0 >= args.ne01) return;
+
+    const int in = args.ne00;
+    float sum = 0.0f;
+
+    device const block_q6_K * blocks = src0 + r0 * (in / 256);
+    for (int ib = 0; ib < (int)(in / 256); ib++) {
+        for (short il = 0; il < 16; il++) {
+            float4x4 reg;
+            dequantize_q6_K(&blocks[ib], il, reg);
+            int base = ib * 256 + il * 16;
+            for (int j = 0; j < 4; j++) {
+                for (int k = 0; k < 4; k++) {
+                    int idx = base + j * 4 + k;
+                    if (idx < in) sum += reg[j][k] * src1[idx];
+                }
+            }
+        }
+    }
+    dst[r0] = sum;
+}
+

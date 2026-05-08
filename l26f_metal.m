@@ -14825,3 +14825,95 @@ static id<MTLComputePipelineState> l26f_metal_get_cached_pipeline(const char *fn
     [g_pipeline_cache setObject:p forKey:key];
     return p;
 }
+
+// =========================================================================
+// L26F: generic quantized matvec (route to correct kernel by weight type)
+// =========================================================================
+
+int l26f_metal_matvec_quant(
+    l26f_metal_tensor       *dst,
+    const l26f_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 out_dim,
+    uint32_t                 weight_type,  // GGUF tensor type
+    uint64_t                 n_tok)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+
+    // Route to appropriate kernel
+    switch (weight_type) {
+    case 1:  // F16 — use ds4's F16 matmul
+        return ds4_metal_matmul_f16_tensor(dst, model_map, model_size,
+                   weight_offset, in_dim, out_dim, src1, n_tok);
+    case 8:  // Q8_0 — use ds4's Q8_0 matmul
+        return ds4_metal_matmul_q8_0_tensor(dst, model_map, model_size,
+                   weight_offset, in_dim, out_dim, src1, n_tok);
+    case 20: // IQ4_NL
+        return l26f_metal_matvec_iq4_nl(dst, src1, model_map, model_size,
+                   weight_offset, in_dim, out_dim, n_tok);
+    default: {
+        // Q5_K (13) or Q6_K (14) — use generic dispatch
+        uint32_t block_size = 256;
+        uint32_t type_size = 0;
+        const char *kernel_name = NULL;
+        if (weight_type == 13) { // Q5_K
+            type_size = 176;
+            kernel_name = "kernel_mul_mv_q5_K_f32";
+        } else if (weight_type == 14) { // Q6_K
+            type_size = 210;
+            kernel_name = "kernel_mul_mv_q6_K_f32";
+        } else {
+            fprintf(stderr, "l26f: unsupported weight type %u\n", weight_type);
+            return 0;
+        }
+        if ((in_dim & (block_size - 1)) != 0 || in_dim == 0 || out_dim == 0 || n_tok != 1) {
+            fprintf(stderr, "l26f: K-quant matvec requires in_dim%%256==0 and n_tok==1\n");
+            return 0;
+        }
+
+        const uint64_t row_bytes = (in_dim / block_size) * type_size;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+
+        @autoreleasepool {
+            id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(src1);
+            id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(dst);
+            if (!xbuf || !outbuf) return 0;
+
+            uint64_t inner_offset = 0;
+            id<MTLBuffer> wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+                weight_offset, weight_bytes, &inner_offset);
+            if (!wbuf) return 0;
+
+            ds4_metal_q8_0_matvec_args args = {
+                .ne00 = (int32_t)in_dim, .ne01 = (int32_t)out_dim, .ne02 = 1,
+                .nb00 = (int32_t)type_size, .nb01 = (int32_t)row_bytes, .nb02 = (int32_t)weight_bytes,
+                .ne10 = (int32_t)in_dim, .ne11 = 1, .ne12 = 1,
+                .nb10 = sizeof(float), .nb11 = (int32_t)(in_dim * sizeof(float)),
+                .ne0 = (int32_t)out_dim, .ne1 = 1,
+                .nr0 = 2, .r2 = 1, .r3 = 1,
+            };
+
+            id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline(kernel_name);
+            if (!pipeline) return 0;
+
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+            if (!cb) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(src1) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(dst) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)out_dim, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            ds4_metal_end_compute_encoder(cb, enc);
+            return ds4_metal_finish_command_buffer(cb, owned, kernel_name);
+        }
+    }
+    }
+}

@@ -55,17 +55,17 @@ int l26f_metal_gla(
     uint32_t n_heads,
     float    scale);
 
-// Quantized matvec (decode): src0[N,M] * src1[M,R,R] -> dst[M,R,R]
-// weight_type: 0=f16, 1=q8_0, 2=q5_k, 3=q6_k, 4=iq4_nl
-int l26f_metal_matvec(
+// Quantized matvec (decode): routes to correct kernel by GGUF weight type
+// weight_type: 1=F16, 8=Q8_0, 13=Q5_K, 14=Q6_K, 20=IQ4_NL
+int l26f_metal_matvec_quant(
     l26f_metal_tensor       *dst,
-    const l26f_metal_tensor *src1,        // input activation [M, R, R]
+    const l26f_metal_tensor *src1,
     const void              *model_map,
     uint64_t                 model_size,
     uint64_t                 weight_offset,
-    uint64_t                 in_dim,       // N
-    uint64_t                 out_dim,      // M
-    int                      weight_type,
+    uint64_t                 in_dim,
+    uint64_t                 out_dim,
+    uint32_t                 weight_type,
     uint64_t                 n_tok);
 
 // RMS Norm (with weight)
