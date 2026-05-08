@@ -1184,7 +1184,7 @@ static const char *ds4_metal_source =
 "// IQ4_NL: 4.5 bpw, 32 elements per block, 18 bytes\n"
 "struct block_iq4_nl {\n"
 "    half d;\n"
-"    uint16_t qs[QK4_NL/2];\n"
+"    uint8_t qs[QK4_NL/2];\n"  // 16 bytes: 32 x 4-bit packed values
 "};\n"
 "\n"
 "// Lookup table for IQ4_NL dequantization\n"
@@ -14766,6 +14766,7 @@ int l26f_metal_matvec_iq4_nl(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(src1) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(dst) atIndex:3];
+            [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             ds4_metal_end_compute_encoder(cb, enc);

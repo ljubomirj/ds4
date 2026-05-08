@@ -1,4 +1,11 @@
-// L26F metal: IQ4_NL, Q5_K, Q6_K dequantize helpers and IQ4_NL matvec kernels
+// L26F metal: IQ4_NL, Q5_K, Q6_K dequantize helpers and matvec kernels
+//
+// IQ4_NL block layout (18 bytes, 32 elements):
+//   offset 0: half d     (2 bytes) — scale factor
+//   offset 2: uint8_t qs[16] (16 bytes) — 32 x 4-bit packed values, 2 per byte
+// Total: 18 bytes
+//
+// IQ4_NL kernel ported from ggml-metal.metal kernel_mul_mv_iq4_nl_f32_impl.
 
 // ---- Dequantize helpers ----
 
@@ -80,7 +87,9 @@ static void dequantize_q6_K(device const block_q6_K *xb, short il, thread float4
     }
 }
 
-// ---- Single-token IQ4_NL matvec for decode ----
+// ---- IQ4_NL single-token decode matvec ----
+// Ported from ggml-metal.metal kernel_mul_mv_iq4_nl_f32_impl.
+// Uses shared memory for the kvalues lookup table, processes NR0=2 rows per threadgroup.
 
 struct l26f_args_mul_mv_iq4_nl {
     int32_t ne00, ne01, ne02;
@@ -94,60 +103,81 @@ struct l26f_args_mul_mv_iq4_nl {
 
 kernel void kernel_mul_mv_iq4_nl_f32(
     constant l26f_args_mul_mv_iq4_nl & args [[buffer(0)]],
-    device const block_iq4_nl  * src0 [[buffer(1)]],
-    device const float         * src1 [[buffer(2)]],
-    device       float         * dst  [[buffer(3)]],
+    device const char               * src0 [[buffer(1)]],
+    device const float              * src1 [[buffer(2)]],
+    device       float              * dst  [[buffer(3)]],
+    threadgroup float               * shmem [[threadgroup(0)]],
     uint3  tgpig[[threadgroup_position_in_grid]],
-    uint   tiisg[[thread_index_in_simdgroup]],
-    uint   sgitg[[simdgroup_index_in_threadgroup]])
+    ushort tiisg[[thread_index_in_simdgroup]],
+    ushort sgitg[[simdgroup_index_in_threadgroup]])
 {
-    const int r0 = (int)tgpig.x * args.nr0;
-    const int r1 = min(r0 + args.nr0, args.ne01);
-    const int ith = (int)tiisg;
-    const int in  = args.ne00;
+    const int NR0 = 2;
+    const int nb  = args.ne00 / 32;
+    const int nbl = args.nb01 / args.nb00;
 
-    float sumf[2] = {0.0f, 0.0f};
-    for (int i = 0; i < in; i += 32) {
-        // Load activation slice
-        device const float * x = src1 + i;
-        float4 xf[2];
-        if (i + 32 <= in) {
-            for (int k = 0; k < 2; k++) {
-                int off = ith + 16*k;
-                xf[k] = float4(x[off], x[off+4], x[off+8], x[off+12]);
-            }
-        } else {
-            for (int k = 0; k < 2; k++) {
-                xf[k] = 0.0f;
-                for (int j = 0; j < 4; j++) {
-                    int idx = ith + 16*k + 4*j;
-                    if (i + idx < in) xf[k][j] = x[idx];
-                }
-            }
+    const int first_row = ((int)tgpig.x * NR0);
+
+    device const block_iq4_nl * x = (device const block_iq4_nl *)(src0 + (uint64_t)first_row * args.nb01);
+    device const float        * y = src1;
+
+    const short ix = tiisg / 2;
+    const short it = tiisg % 2;
+
+    shmem[tiisg] = kvalues_iq4nl_f[tiisg % 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 yl[4];
+    float sumf[2] = {0.f};
+
+    device const float * yb = y + ix * 32 + it * 8;
+
+    uint32_t aux32[2];
+    thread const uint8_t * q8 = (thread const uint8_t *)aux32;
+
+    float4 qf1, qf2;
+
+    for (int ib = ix; ib < nb; ib += 16) {
+        device const float4 * y4 = (device const float4 *)yb;
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        for (short row = 0; row < NR0; row++) {
+            if (first_row + row >= args.ne01) break;
+            device const block_iq4_nl & xb = x[(uint64_t)row * nbl + ib];
+            device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8*it);
+
+            float4 acc1 = {0.f}, acc2 = {0.f};
+
+            aux32[0] = q4[0] | (q4[1] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+            aux32[0] &= 0x0f0f0f0f;
+            qf1 = {shmem[q8[0]], shmem[q8[1]], shmem[q8[2]], shmem[q8[3]]};
+            qf2 = {shmem[q8[4]], shmem[q8[5]], shmem[q8[6]], shmem[q8[7]]};
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = q4[2] | (q4[3] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+            aux32[0] &= 0x0f0f0f0f;
+            qf1 = {shmem[q8[0]], shmem[q8[1]], shmem[q8[2]], shmem[q8[3]]};
+            qf2 = {shmem[q8[4]], shmem[q8[5]], shmem[q8[6]], shmem[q8[7]]};
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+            sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
         }
 
-        // Dot with weights
-        for (int r = r0; r < r1; r++) {
-            device const block_iq4_nl * block = src0 + r * (in / 32) + i / 32;
-            const float d = (float)block->d;
-            for (int k = 0; k < 2; k++) {
-                device const uint16_t * q16 = (device const uint16_t *)block->qs + 2*(k*4);
-                uint32_t aux = (uint32_t)(q16[0] | (q16[1] << 16));
-                thread const uint8_t * q8 = (thread const uint8_t *)&aux;
-                int jo = ith + 16*k;
-                for (int jj = 0; jj < 4; jj++) {
-                    int j = jo + 4*jj;
-                    if (j < 32 && i + j < in) {
-                        sumf[r - r0] += d * kvalues_iq4nl_f[q8[jj] & 0xf] * xf[k][jj];
-                    }
-                }
-            }
-        }
+        yb += 16 * 32;
     }
 
-    for (int r = r0; r < r1; r++) {
-        float sum = simd_sum(sumf[r - r0]);
-        if (ith == 0) dst[r] = sum;
+    for (int row = 0; row < NR0 && first_row + row < args.ne01; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst[first_row + row] = sum_all;
+        }
     }
 }
 
@@ -172,7 +202,6 @@ kernel void kernel_mul_mv_q5_K_f32(
     if (r0 >= args.ne01) return;
 
     const int in  = args.ne00;
-    const int nth = (int)(args.ne01); // use ne01 as thread count for dispatch
     float sum = 0.0f;
 
     device const block_q5_K * blocks = src0 + r0 * (in / 256);
@@ -222,4 +251,3 @@ kernel void kernel_mul_mv_q6_K_f32(
     }
     dst[r0] = sum;
 }
-
