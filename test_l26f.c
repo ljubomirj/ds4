@@ -55,7 +55,7 @@ static void test_gla_layer(l26f_model *m) {
     // Step 1: RMS Norm
     printf("1. RMS norm...\n");
     if (!ds4_metal_rms_norm_weight_tensor(normed, inp, m->map, m->size,
-                                          wt_norm->abs_offset - m->tensor_data_pos,
+                                          wt_norm->abs_offset,
                                           n_embd, 1e-6f)) {
         fprintf(stderr, "RMS norm failed\n"); return;
     }
@@ -63,7 +63,7 @@ static void test_gla_layer(l26f_model *m) {
     // Step 2: attn_qkv matvec
     printf("2. QKV matvec...\n");
     if (!l26f_metal_matvec_quant(qkv, normed, m->map, m->size,
-                                 wt_qkv->abs_offset - m->tensor_data_pos,
+                                 wt_qkv->abs_offset,
                                  wt_qkv->dim[0], wt_qkv->dim[1], wt_qkv->type, 1)) {
         fprintf(stderr, "QKV matvec failed\n"); return;
     }
@@ -71,7 +71,7 @@ static void test_gla_layer(l26f_model *m) {
     // Step 3: attn_gate matvec
     printf("3. Gate matvec...\n");
     if (!l26f_metal_matvec_quant(gate, normed, m->map, m->size,
-                                 wt_gate->abs_offset - m->tensor_data_pos,
+                                 wt_gate->abs_offset,
                                  wt_gate->dim[0], wt_gate->dim[1], wt_gate->type, 1)) {
         fprintf(stderr, "Gate matvec failed\n"); return;
     }
@@ -98,7 +98,7 @@ static void test_gla_layer(l26f_model *m) {
     printf("5. Output matvec...\n");
     ds4_metal_tensor *gla_act = ds4_metal_tensor_view(gla_out, 0, act_bytes);
     if (!l26f_metal_matvec_quant(proj, gla_act, m->map, m->size,
-                                 wt_out->abs_offset - m->tensor_data_pos,
+                                 wt_out->abs_offset,
                                  wt_out->dim[0], wt_out->dim[1], wt_out->type, 1)) {
         fprintf(stderr, "Output matvec failed\n"); return;
     }

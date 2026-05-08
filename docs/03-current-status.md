@@ -1,4 +1,4 @@
-# l26f — Current Status & Remaining Blocker
+# l26f — Current Status
 
 **Date**: 2026-05-08
 **Branch**: `l26f` (ljubomirj/l26f fork of antirez/ds4)
@@ -6,28 +6,13 @@
 
 ---
 
-## What Works
+## What Works (All Verified)
 
 ### 1. GGUF Model Loader (`l26f_gguf.c`)
 
 Parses GGUF v3, reads metadata KV pairs (extracting model params), enumerates all
 540 tensors with correct names, shapes, types, and file offsets. Verified against
 the Python `gguf` library — offsets match exactly.
-
-Key bug that was fixed: `tensor_data_pos` was computed from the position BEFORE
-tensor info entries, but must be computed AFTER all entries plus alignment
-padding. The fix (commit `141b72a`) computes `tensor_data_pos` as the aligned
-position after parsing all tensor entries:
-
-```c
-// CORRECT: after loop, align to 32 bytes
-uint64_t pos = (uint64_t)(c->ptr - m->map);
-m->tensor_data_pos = (pos + 31) & ~31;
-// Then: abs_offset = tensor_data_pos + gguf_offset
-```
-
-Before the fix, offsets were off by ~34KB, causing all kernel dispatches to read
-garbage weight data.
 
 ### 2. Metal Shader Compilation
 
@@ -36,177 +21,135 @@ All kernels compile into a single Metal library:
 - `metal/l26f_gla.metal` — GLA kernel ported from llama.cpp
 - `metal/l26f_dense.metal` — IQ4_NL/Q5_K/Q6_K dequant helpers + matvec kernels
 
-Block struct definitions for IQ4_NL, Q5_K, Q6_K live in the Metal source prefix
-(C string in `l26f_metal.m`). The IQ4_NL lookup table (`kvalues_iq4nl_f[16]`)
-is also in the prefix.
-
 ### 3. Metal Runtime
 
 - `ds4_metal_init()` succeeds
-- Model map wrapping: 2 overlapping MTLBuffer views covering 58 GiB. Created via
-  `newBufferWithBytesNoCopy` from the mmap'd file. Residency takes 1-16 seconds.
-- Tensor allocation works (`ds4_metal_tensor_alloc`, `ds4_metal_tensor_view`)
+- Model map wrapping: 2 overlapping MTLBuffer views covering 58 GiB
+- Tensor allocation/view/free all work
 
-### 4. GLA Kernel (Isolated Test)
+### 4. Full GLA Layer Pipeline (End-to-End)
 
-The GLA kernel (`kernel_gla_impl<NSG>`) was tested with random Q/K/V/G inputs
-(no weight lookup, no matvec) and produces correct non-NaN output:
+**This is the big milestone.** The complete GLA layer pipeline runs correctly:
 
 ```
-Input: 4096 random floats
-GLA output sum: 1686.548, 0 NaNs
-State sum: 129411.375, 0 NaNs
+Input (4096 floats) → RMS Norm → QKV Matvec → Gate Matvec → GLA Attention → Output Matvec → Residual Add → Output
 ```
 
-The kernel writes activations + final state to a single output buffer, then a
-blit encoder copies the state back to the state buffer. This was verified to
-work correctly after fixing a command buffer ordering bug (blit was after commit;
-must be before commit).
+Test result:
+```
+Result: sum=2026.004883 min=-1.412428 max=1.580171 avg=0.494630
+First 10 values: 0.2035 -0.0913 0.0195 0.1277 0.0624 0.1691 -0.1161 0.1925 -0.0783 0.0954
+State: sum=28.941093
+```
 
-### 5. Q5_K Matvec Dispatch
+Zero NaNs. All values in reasonable range. State updated correctly.
 
-The dispatch code routes to the correct kernel. The `l26f_metal_matvec_quant()`
-function selects between ds4's Q8_0/F16 matmul and our Q5_K/Q6_K/IQ4_NL kernels.
-Dispatch returns 1 (success) for qkv and gate projections.
+### Bugs Fixed So Far
 
-### 6. Reusable ds4 Infrastructure
+1. **GGUF tensor_data_pos calculation** (commit `141b72a`): Was computed before
+   tensor info entries; fixed to compute after all entries + alignment padding.
 
-All ds4 Metal kernels are available: RMS norm, SiLU, SwiGLU, element-wise ops,
-embedding lookup, softmax, RoPE, concat, argsort, set_rows, sum_rows, etc.
+2. **Weight offset bug**: `test_l26f.c` was subtracting `tensor_data_pos` from
+   `abs_offset` before passing to Metal functions. `abs_offset` is already the
+   absolute file position (`tensor_data_pos + gguf_offset`). The Metal views
+   cover the entire file from byte 0, so the offset must be passed directly —
+   exactly as ds4 does it. Subtracting `tensor_data_pos` shifted all reads by
+   ~34KB into garbage, producing ~42 NaN values out of 4096 in RMS norm output.
 
 ---
 
-## The Remaining Blocker: NaN in RMS Norm
+## Lessons Learned
 
-### Symptom
+### 1. `abs_offset` is absolute — never adjust it for Metal
 
-After RMS norm on a valid 4096-element input (no NaNs, values in [0, 1)), the
-output has ~42 NaN values (out of 4096, about 1%). The NaN positions are not
-contiguous or obviously patterned.
+The GGUF loader computes `abs_offset = tensor_data_pos + gguf_offset`. This is
+the byte offset from the start of the mmap'd file. The Metal views (created by
+`ds4_metal_set_model_map`) cover the entire file from byte 0. Therefore:
+- **Always pass `abs_offset` directly** to `ds4_metal_*` functions.
+- **Never subtract `tensor_data_pos`** — it's already baked in.
+- ds4's own code confirms this pattern (grep for `abs_offset` in ds4.c).
 
-The input is deterministic:
-```c
-for (i = 0; i < 4096; i++)
-    x[i] = (float)((i * 7 + 13) % 1000) / 1000.0f;  // values in [0, 1)
+### 2. When adapting ds4 code, follow ds4's calling conventions exactly
+
+ds4 was the reference implementation. Every time we wrapped a ds4 function call,
+we should have copied the argument pattern verbatim from ds4.c. The NaN bug
+arose because we "adapted" the offset calculation differently from ds4.
+**Rule: if ds4 passes X, we pass X — no clever arithmetic.**
+
+### 3. NaN in kernel output ≈ wrong data being read
+
+When a Metal kernel produces NaN on valid inputs, the most likely cause is that
+it's reading from the wrong memory. Before debugging kernel math, verify:
+1. The weight offset passed to `ds4_metal_wrap_model_range` is correct
+2. The data at that file offset is what you expect (read back and print)
+3. The inner_offset returned by the view lookup makes sense
+
+### 4. The 34KB header offset is a constant trap
+
+GGUF files have a ~34KB header (magic, version, KV pairs, tensor info entries)
+before tensor data begins. Two offset spaces exist:
+- **File offset**: absolute position in the file (what `abs_offset` gives you)
+- **GGUF offset**: position relative to the tensor data section (what the GGUF
+  spec calls "offset" in the tensor info entry)
+
+Never confuse the two. `abs_offset` resolves GGUF offset → file offset. The
+Metal mmap starts at file byte 0. Everything going to Metal uses file offsets.
+
+---
+
+## What's Next
+
+### P0: Multi-Layer Transformer Loop
+
+Build the full 32-layer inference loop. Each GLA layer (28 of 32) does:
+
+```
+for each token position:
+    1. RMS norm (attn)
+    2. QKV matvec (Q5_K, 4096→12288)
+    3. Gate matvec (Q5_K, 4096→4096)
+    4. GLA attention (S=128, H=32)
+    5. Output matvec (Q5_K, 4096→4096)
+    6. Residual add
+    7. RMS norm (FFN)
+    8. FFN (MoE or shared — needs MoE kernel)
+    9. Residual add
 ```
 
-A CPU simulation of the same calculation produces zero NaNs:
-```c
-ss = sum(x[i] * x[i])
-rms = sqrt(ss / n + 1e-6f)
-out[i] = w[i] * x[i] / rms  // all valid, sum = 1413.9
-```
+### P1: MLA Layers (layers 7, 15, 23, 31)
 
-### Dispatch Path
+4 global attention layers use DeepSeek2-style MLA instead of GLA.
+Can reuse ds4's MLA kernels directly.
 
-The RMS norm goes through:
-1. `ds4_metal_rms_norm_weight_tensor(out, inp, model_map, model_size, weight_offset, n, eps)`
-2. → calls `ds4_metal_rms_norm_weight_rows_tensor` with `rows=1`
-3. → finds weight MTLBuffer via `ds4_metal_wrap_model_range(model_map, model_size, weight_offset, row_bytes, &inner_offset)`
-4. → dispatches `kernel_rms_norm_mul_f32_4` (weighted RMS norm, float4 vectorized)
-5. → grid: `(1, 1, 1)`, threads: `(ds4_metal_rms_norm_threads(n), 1, 1)`
+### P2: MoE Expert Routing + Matvec
 
-The weight is `blk.0.attn_norm.weight`: F32, 4096 elements, at file offset
-1223754240 from tensor data start (verified against Python GGUF reader).
+256 experts, 8 active per token, group expert selection (n_group=8, topk_group=4).
+Need routing kernel + per-expert matvec with IQ4_NL/Q5_K weights.
+ds4 has MoE kernels for Q8_0 — need extending for our quant types.
 
-### Weight Data Verification
+### P3: Tokenizer + Sampling + CLI
 
-The raw weight data at the correct offset appears reasonable:
-```
-First 10 floats: 0.342 0.307 0.434 0.320 0.369 0.395 0.379 0.291 0.334 0.377
-```
+BPE tokenizer (157184 vocab), temperature/top-k/top-p sampling, CLI interface.
 
-These are typical LayerNorm weight values (in the 0.2-0.5 range, all positive).
+---
 
-### Theories for NaN Origin
-
-**Theory A: MTLBuffer view reads wrong data**
-
-The `ds4_metal_wrap_model_range` function finds which view covers the requested
-range and returns the MTLBuffer + inner offset. For a weight at file offset
-1223754240:
-
-- View 0 covers offset [0, 57982058496) — 0 to 54 GiB
-- View 1 covers offset [57277399040, 61807443968) — 53.3 GiB to 57.6 GiB
-
-The weight at 1223754240 (1.14 GiB) falls in View 0. The inner offset should be
-1223754240. The kernel accesses `wbuf + inner_offset`. If the inner offset is
-wrong, the kernel reads from the wrong position in the buffer.
-
-**Theory B: Kernel reads Out-of-Bounds**
-
-The RMS norm weight kernel (`kernel_rms_norm_mul_f32_4`) is a ds4 kernel that
-reads weight values. If it reads past the end of the weight buffer, it might hit
-unmapped memory or read NaNs. The weight buffer is 16384 bytes (4096 * 4). The
-kernel processes 4096 elements with float4 vectorization, which should be safe.
-
-**Theory C: Residency Set Bug**
-
-The ds4 Metal residency set is registered after model map wrapping. If the kernel
-accesses a weight page that hasn't been faulted in yet, it might get NaN. The
-residency set should prevent this, but there might be an edge case.
-
-**Theory D: Q5_K Kernel Produces NaNs That Cascade**
-
-The earlier test showed the GLA kernel works with random inputs but the full
-pipeline fails. The Q5_K matvec kernel might produce NaN for some weight values
-that then cascade through GLA. But the isolated RMS norm test also shows NaN,
-so this can't be the sole cause.
-
-### How to Reproduce
-
-```bash
-cd ~/llama.cpp/contrib/l26f
-make test_l26f
-./test_l26f ~/llama.cpp/models/Ling-2.6-flash-IQ4_NL-quality-bailing_hybrid-20260508-LJ.gguf
-```
-
-The `test_l26f.c` file runs a full GLA layer (RMS norm → QKV matvec → Gate matvec → GLA → Output matvec → Add) and prints the output.
-
-### Key Files
+## Key Files
 
 | File | Role |
 |------|------|
 | `l26f_gguf.c:156-193` | Tensor parsing with abs_offset calculation |
 | `l26f_metal.m:14558-14695` | GLA dispatch (blit before commit) |
 | `l26f_metal.m:4385-4410` | Model map view setup |
+| `l26f_metal.m:14842` | Generic quantized matvec dispatch |
 | `metal/l26f_gla.metal` | GLA kernel |
 | `metal/l26f_dense.metal` | IQ4_NL/Q5_K/Q6_K matvec + dequant helpers |
-| `metal/norm.metal` | RMS Norm kernels (from ds4, unmodified) |
+| `metal/norm.metal` | RMS Norm kernels (from ds4) |
 | `test_l26f.c` | End-to-end GLA layer test |
-| `test_l26f_standalone.c` | (from /tmp) Isolated GLA kernel test |
 
-### Build
+## Build & Run
 
 ```bash
 cd ~/llama.cpp/contrib/l26f
 make
-# Produces: test_l26f (binary)
+./test_l26f ~/llama.cpp/models/Ling-2.6-flash-IQ4_NL-quality-bailing_hybrid-20260508-LJ.gguf
 ```
-
-### Next Debugging Steps
-
-1. **Verify RMS norm weight in Metal**: Write a test that copies the weight from
-   the MTLBuffer back to CPU and compares byte-by-byte with the mmap data.
-
-2. **Test RMS norm with small buffers**: Try n=32 or n=64 to narrow down if it's
-   a size-dependent issue.
-
-3. **Test RMS norm without weight** (plain RMS norm): Use
-   `ds4_metal_rms_norm_plain_tensor` which doesn't load weights, to isolate
-   whether the weight reading is the issue.
-
-4. **Check Metal residency**: Add env var `DS4_METAL_NO_RESIDENCY=1` to skip
-   residency and test if the issue is residency-related.
-
-5. **Read back individual tensor data**: After each kernel dispatch, read back
-   and inspect the output to find exactly which values become NaN.
-
-6. **lldb**: Attach lldb to get a stack trace on the segfault/NaN.
-
-### Things NOT to Change
-
-- The GGUF loader is working correctly (verified against Python)
-- The GLA kernel produces correct output with random inputs
-- The model map wrapping works
-- The `ds4_metal.m` file is a copy of ds4's — minimal changes only
