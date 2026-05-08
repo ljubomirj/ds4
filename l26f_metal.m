@@ -14689,3 +14689,139 @@ int l26f_metal_gla(
         return ds4_metal_finish_command_buffer(cb, 0, "GLA finish");
     }
 }
+
+// =========================================================================
+// L26F: IQ4_NL matvec dispatch
+// =========================================================================
+
+int l26f_metal_matvec_iq4_nl(
+    l26f_metal_tensor       *dst,
+    const l26f_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 out_dim,
+    uint64_t                 n_tok)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if ((in_dim & 31u) != 0 || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+
+    const uint64_t blocks_per_row = in_dim / 32u;
+    const uint64_t row_bytes = blocks_per_row * sizeof(block_iq4_nl); // 18 bytes per block
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(src1);
+        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(dst);
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_metal_tensor_bytes(src1) < x_bytes ||
+            ds4_metal_tensor_bytes(dst) < out_bytes) return 0;
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+            weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (n_tok == 1) {
+            struct {
+                int32_t ne00, ne01, ne02;
+                int32_t nb00, nb01, nb02;
+                int32_t ne10, ne11, ne12;
+                int32_t nb10, nb11;
+                int32_t ne0,  ne1;
+                int32_t nr0;
+                int16_t r2, r3;
+            } args = {
+                (int32_t)in_dim, (int32_t)out_dim, 1,
+                18, (int32_t)row_bytes, (int32_t)weight_bytes,
+                (int32_t)in_dim, 1, 1,
+                (int32_t)sizeof(float), (int32_t)(in_dim * sizeof(float)),
+                (int32_t)out_dim, 1,
+                2, 1, 1,
+            };
+
+            id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline("kernel_mul_mv_iq4_nl_f32");
+            if (!pipeline) return 0;
+
+            id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(src1) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(dst) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            ds4_metal_end_compute_encoder(cb, enc);
+        } else if (n_tok <= 5) {
+            // Small-batch matvec
+            const short r1ptg = (short)n_tok;
+            char fname[64];
+            snprintf(fname, sizeof(fname), "kernel_mul_mv_ext_iq4_nl_f32_r1_%d", r1ptg);
+
+            struct {
+                int32_t ne00, ne01, ne02;
+                uint64_t nb00, nb01, nb02, nb03;
+                int32_t ne10, ne11, ne12;
+                uint64_t nb10, nb11, nb12, nb13;
+                int32_t ne0, ne1;
+                int16_t r2, r3;
+            } ext_args = {
+                (int32_t)in_dim, (int32_t)out_dim, (int32_t)n_tok,
+                (uint64_t)row_bytes / blocks_per_row, row_bytes, weight_bytes, weight_bytes,
+                (int32_t)in_dim, (int32_t)n_tok, (int32_t)n_tok,
+                (uint64_t)sizeof(float), in_dim * sizeof(float), in_dim * (uint64_t)n_tok * sizeof(float), in_dim * (uint64_t)n_tok * sizeof(float),
+                (int32_t)out_dim, (int32_t)n_tok,
+                1, 1,
+            };
+
+            id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline(fname);
+            if (!pipeline) return 0;
+
+            const short nsg = 2;
+            const short nxpsg = (short)MAX(1, (int32_t)in_dim / (128 * (int32_t)n_tok));
+            id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&ext_args length:sizeof(ext_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(src1) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(dst) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, (NSUInteger)nxpsg, (NSUInteger)n_tok)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+            ds4_metal_end_compute_encoder(cb, enc);
+        } else {
+            fprintf(stderr, "l26f: IQ4_NL matvec only supports n_tok<=5 for now\n");
+            return 0;
+        }
+
+        return ds4_metal_finish_command_buffer(cb, owned, "IQ4_NL matvec");
+    }
+}
+
+// Helper to get a cached pipeline by name
+static id<MTLComputePipelineState> l26f_metal_get_cached_pipeline(const char *fname) {
+    NSString *key = [NSString stringWithUTF8String:fname];
+    id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
+    if (cached) return cached;
+    NSError *error = nil;
+    id<MTLFunction> fn = [g_library newFunctionWithName:[NSString stringWithUTF8String:fname]];
+    if (!fn) {
+        fprintf(stderr, "l26f: Metal function %s not found\n", fname);
+        return nil;
+    }
+    id<MTLComputePipelineState> p = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!p) {
+        fprintf(stderr, "l26f: Metal pipeline %s failed: %s\n",
+                fname, [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+    [g_pipeline_cache setObject:p forKey:key];
+    return p;
+}

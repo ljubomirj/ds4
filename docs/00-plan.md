@@ -86,6 +86,19 @@ From llama.cpp:
 - [ ] Direct Metal allocation (skip llama.cpp's GGML tensor system)
 - [ ] Verify all 540 tensors load correctly
 
+### Phase 2: Metal Layer — IN PROGRESS
+- [x] GLA kernel ported from llama.cpp (metal/l26f_gla.metal)
+- [x] GLA dispatch function (l26f_metal.m)
+- [x] IQ4_NL/Q5_K/Q6_K block structs + dequant helpers (metal/l26f_dense.metal)
+- [x] IQ4_NL single-token matvec kernel (metal/l26f_dense.metal)
+- [x] IQ4_NL small-batch matvec instantiations
+- [x] IQ4_NL matvec dispatch function (l26f_metal.m)
+- [ ] Q5_K matvec kernel + dispatch
+- [ ] Q6_K matvec kernel + dispatch
+- [x] Reusable ds4 kernels: norms, SiLU, SwiGLU, bin ops, cpy, embedding, softmax, RoPE, MoE router, argsort, set_rows
+- [ ] MLA kernel (DeepSeek2-style compressed attention)
+- [ ] MoE expert matmul with IQ4_NL/Q5_K/Q6_K weights
+
 ### Phase 2: GLA Forward Pass
 - [ ] Port GLA Metal kernel from llama.cpp (non-fused, with keep_intermediates)
 - [ ] GLA recurrent state management (S state per layer per sequence)
