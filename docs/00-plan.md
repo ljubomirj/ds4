@@ -109,10 +109,24 @@ From llama.cpp:
 
 ### Phase 5: Caching (The Big One)
 - [ ] Sliding window ring buffer for MLA KV (ds4-style)
-- [ ] GLA recurrent state per layer
-- [ ] Compressed attention cache (ratio-4 and ratio-128, ds4-style)
-- [ ] Compressor frontier state tracking
-- [ ] Self-contained checkpoint format (tokens + logits + all cache state)
+- [ ] GLA recurrent state per layer — snapshot at checkpoint boundaries
+- [ ] Self-contained checkpoint format (tokens + logits + MLA KV + GLA S state)
+
+#### Recurrent State Cutoff Strategy
+
+GLA's S state is fixed-size (128×128×32 floats = ~2 MB per layer in F32, ~56 MB
+for 28 layers). It doesn't grow with context. But over extremely long sequences
+(100K+ tokens), the accumulated state can degrade — old information gets "sticky"
+due to gating numerical drift.
+
+**Decision**: Snapshot S state at regular checkpoint intervals. When restoring:
+1. Load nearest snapshot S state
+2. Replay only tokens since that snapshot to reconstruct current S
+3. This bounds both restore time AND the effective recurrent horizon
+
+All model weights are ≤ 8-bit quantized. The S state snapshots (+KV ring) are
+tiny compared to the 58 GB model. Checkpoint files stay practical even with
+frequent snapshots.
 
 ### Phase 6: Server
 - [ ] HTTP server (libmicrohttpd or minimal select/poll)
