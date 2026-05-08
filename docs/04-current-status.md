@@ -227,54 +227,87 @@ once the IQ4_NL blocker is resolved.
 
 ---
 
-## Bugs Fixed So Far
+## Bugs Fixed So Far (chronological)
 
-1. **GGUF tensor_data_pos** (commit `141b72a`): computed before tensor entries;
-   fixed to compute after all entries + alignment padding.
+**Bug 1: GGUF tensor_data_pos calculated too early** (commit `141b72a`)
 
-2. **Weight offset subtraction** (commit `b2c4d08`): `test_l26f.c` subtracted
-   `tensor_data_pos` from `abs_offset`. Metal views cover the full file from
-   byte 0, so `abs_offset` should be passed directly (as ds4 does).
+The GGUF file has a header (magic, version, KV pairs, tensor info entries) before
+the tensor data section. `tensor_data_pos` marks where data begins. The code
+computed it from the cursor position *before* iterating over the 540 tensor info
+entries. After the loop, the cursor had advanced past all entries. Fix: compute
+`tensor_data_pos` after the loop, aligned to 32 bytes.
 
-3. **Q8_0 embedding** (uncommitted): token embedding is Q8_0, not F32. Was
-   reading raw bytes as floats → garbage. Fixed with proper block dequant.
+**Bug 2: Weight offset had tensor_data_pos subtracted** (commit `b2c4d08`)
+
+`abs_offset = tensor_data_pos + gguf_offset` — already an absolute file position.
+The Metal views cover the entire file from byte 0. But test_l26f.c subtracted
+`tensor_data_pos` before passing to Metal functions, shifting all reads ~34KB
+into garbage. The values at the wrong offset happened to look like valid weights
+(same quant block format repeats), so some operations partially worked before
+producing NaN. Fix: pass `abs_offset` directly, as ds4 does.
+
+**Bug 3: Token embedding treated as F32 when it's Q8_0** (uncommitted)
+
+The `token_embd.weight` tensor is Q8_0 quantized (34 bytes per 32-element block).
+The code read raw bytes as floats — producing values like 10^38. Fix: CPU-side
+Q8_0 block dequant (half scale + 32 int8 quants per block).
+
+**Bug 4: block_iq4_nl Metal struct was 34 bytes, should be 18** (commit `ad631b6`)
+
+The struct had `uint16_t qs[QK4_NL/2]` = `uint16_t qs[16]` = 32 bytes for the
+quant array. But IQ4_NL packs 32 4-bit values into 16 bytes (`uint8_t qs[16]`).
+So the struct was 2+32=34 bytes instead of 2+16=18.
+
+Every IQ4_NL weight read was corrupted: the kernel read 34 bytes per block but
+the file stores 18 bytes per block, so each block read spilled into the next
+block's scale factor, producing garbage d values and NaN. This affected 199 of
+540 tensors in the quality GGUF (all FFN gate/up projections) and 304 of 540
+tensors in the original GGUF (including attention QKV).
+
+The IQ4_NL matvec kernel was also rewritten — the old one was a hand-written
+kernel with incorrect qs access patterns for the 18-byte block. The new one is
+ported from llama.cpp's `kernel_mul_mv_iq4_nl_f32_impl`, which uses shared memory
+for the kvalues lookup table and correctly splits `qs` into two 8-byte halves.
 
 ---
 
 ## Lessons Learned
 
-### 1. `abs_offset` is absolute — never adjust for Metal
+### 1. Port block structs verbatim from the reference
+
+The IQ4_NL bug arose because the Metal struct was written from memory instead of
+copied from llama.cpp's `ggml-common.h`. **Always copy struct definitions
+byte-for-byte.** Verify sizeof matches GGUF type_size: 18 for IQ4_NL, 176 for
+Q5_K, 210 for Q6_K, 34 for Q8_0.
+
+### 2. `abs_offset` is absolute — never adjust for Metal
 
 `abs_offset = tensor_data_pos + gguf_offset`. Metal views cover entire file from
-byte 0. Pass `abs_offset` directly to all `ds4_metal_*` functions. Never subtract
-`tensor_data_pos`. ds4's own code confirms this pattern.
+byte 0. Pass `abs_offset` directly. Never subtract `tensor_data_pos`.
 
-### 2. Match ds4's calling conventions exactly
+### 3. Match ds4's calling conventions exactly
 
 If ds4 passes X to a function, we pass X. No "adapting" or "adjusting".
 
-### 3. NaN ≈ wrong data being read
+### 4. NaN ≈ wrong data being read
 
-Before debugging kernel math, verify the weight offset, the data at that offset,
-and the inner_offset from the view lookup.
+Before debugging kernel math, verify offsets and data at those offsets.
 
-### 4. Two offset spaces — don't confuse them
+### 5. Two offset spaces — don't confuse them
 
 - **File offset**: absolute position in the mmap'd file (what `abs_offset` gives)
 - **GGUF offset**: position relative to tensor data section
 - Metal uses file offsets. `abs_offset` converts GGUF → file.
 
-### 5. Port block structs from llama.cpp verbatim
+### 6. Quant type matters for every weight
 
-The IQ4_NL bug arose because the Metal struct was written from memory instead
-of copied from llama.cpp's `ggml-common.h`. **Always copy struct definitions
-byte-for-byte from the reference implementation.** Verify the sizeof matches the
-GGUF type_size (18 for IQ4_NL, 176 for Q5_K, 210 for Q6_K, 34 for Q8_0).
+The model mixes F32, Q8_0, Q5_K, Q6_K, and IQ4_NL. Always check `tensor->type`.
 
-### 6. Quant type matters for every weight — check before using
+### 7. When rewriting a kernel, don't break other kernels
 
-Not all weights are the same type. The model mixes F32, Q8_0, Q5_K, Q6_K, and
-IQ4_NL. Always check `tensor->type` before dispatching to a kernel.
+The first attempt at fixing l26f_dense.metal replaced the Q5_K and Q6_K kernels
+with incorrect scalar-loop versions, breaking the working attention path. Only
+modify what needs fixing.
 
 ---
 
@@ -295,14 +328,9 @@ the IQ4_NL block struct fix is required.
 
 We're using the quality GGUF for now (attn path works with Q5_K).
 
-### P0: Fix IQ4_NL block struct (unblocks everything)
+### ~~P0: Fix IQ4_NL block struct~~ DONE (commit `ad631b6`)
 
-1. Copy `block_iq4_nl` from llama.cpp's `ggml-common.h` exactly
-2. Fix all `qs` access patterns in dequant helpers + matvec kernel
-3. Verify: sizeof(block_iq4_nl) == 18 in Metal
-4. Test: layer 0 dense FFN (gate + up + SwiGLU + down) should produce valid output
-
-### P1: Multi-layer GLA loop (after P0)
+### P1: MoE FFN (current blocker for layers 1-31)
 
 With IQ4_NL working, the multi-layer driver can run:
 - Layer 0: GLA + dense FFN (all kernels working)
@@ -332,7 +360,7 @@ BPE (157184 vocab), temperature/top-k/top-p, CLI interface.
 |------|------|
 | `l26f_gguf.c:156-193` | Tensor parsing with abs_offset calculation |
 | `l26f.h` | Data structures, GGUF types (block_size/type_size table) |
-| `l26f_metal.m:1185` | **BUG** — `block_iq4_nl` struct in Metal prefix (34 bytes, should be 18) |
+| `l26f_metal.m:1185` | `block_iq4_nl` struct in Metal prefix (fixed: uint8_t qs[16]) |
 | `l26f_metal.m:14706` | IQ4_NL matvec dispatch |
 | `l26f_metal.m:14842` | Generic quantized matvec dispatch router |
 | `l26f_metal.m:14592` | GLA dispatch (blit before commit) |
