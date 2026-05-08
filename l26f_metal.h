@@ -37,18 +37,18 @@ int  l26f_metal_synchronize(void);
 
 // GLA: Gated Linear Attention
 //
-// k, v, q, g:  [S, H, n_tokens]  where S=head_dim=128, H=n_heads=32
-// state:       [S*S*H, n_seqs]   recurrent state (in-place: read old, write new)
-// output:      [S*H, n_tokens]   attention output
-// state_out:   [S*S*H, n_seqs]   updated recurrent state
+// k, v, q, g:  [S, H, n_tokens]  where S=head_dim, H=n_heads
+// state:       [S*S*H, n_seqs]   recurrent state (in/out: updated in-place)
+// output:      [S*H, n_tokens + S*S*H*n_seqs]  activations + final state
+//   Layout: first S*H*n_tokens elements = attention output
+//           then  S*S*H*n_seqs elements = updated recurrent state
 int l26f_metal_gla(
-    l26f_metal_tensor       *output,
-    l26f_metal_tensor       *state_out,
+    l26f_metal_tensor       *output,       // [S*H, n_tokens + S*S*H*n_seqs]
+    l26f_metal_tensor       *state,        // [S*S*H, n_seqs] recurrent state (in: prev, out: updated)
     const l26f_metal_tensor *k,
     const l26f_metal_tensor *v,
     const l26f_metal_tensor *q,
     const l26f_metal_tensor *g,
-    const l26f_metal_tensor *state_in,
     uint32_t n_tokens,
     uint32_t n_seqs,
     uint32_t head_dim,

@@ -1233,6 +1233,7 @@ static NSString *ds4_metal_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"L26F_METAL_DENSE_SOURCE",     @"metal/l26f_dense.metal"],
         @[@"L26F_METAL_GLA_SOURCE",       @"metal/l26f_gla.metal"],
     ];
 
@@ -14551,4 +14552,140 @@ int ds4_metal_matmul_q8_0_hc_expand_tensor(
     }
 
     return 1;
+}
+
+// =========================================================================
+// L26F: Gated Linear Attention (GLA) kernel dispatch
+// =========================================================================
+
+static id<MTLComputePipelineState> l26f_metal_gla_pipeline(uint32_t head_dim) {
+    const short nsg = (short)(head_dim / 32);
+    char fname[64];
+    snprintf(fname, sizeof(fname), "kernel_gla_%d", (int)nsg);
+    NSString *key = [NSString stringWithUTF8String:fname];
+    id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
+    if (cached) return cached;
+
+    NSError *error = nil;
+    id<MTLFunction> fn = [g_library newFunctionWithName:[NSString stringWithUTF8String:fname]];
+    if (!fn) {
+        fprintf(stderr, "l26f: Metal %s function not found\n", fname);
+        return nil;
+    }
+    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!pipeline) {
+        fprintf(stderr, "l26f: Metal %s pipeline failed: %s\n",
+                fname, [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+    [g_pipeline_cache setObject:pipeline forKey:key];
+    return pipeline;
+}
+
+int l26f_metal_gla(
+    l26f_metal_tensor       *output,
+    l26f_metal_tensor       *state,
+    const l26f_metal_tensor *k,
+    const l26f_metal_tensor *v,
+    const l26f_metal_tensor *q,
+    const l26f_metal_tensor *g,
+    uint32_t n_tokens,
+    uint32_t n_seqs,
+    uint32_t head_dim,
+    uint32_t n_heads,
+    float    scale)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (head_dim == 0 || n_heads == 0 || n_tokens == 0 || n_seqs == 0) return 0;
+
+    const short S = (short)head_dim;
+    const short H = (short)n_heads;
+    const short T = (short)n_tokens;
+    const short nsg = S / 32;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = l26f_metal_gla_pipeline(head_dim);
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> kbuf   = ds4_metal_tensor_buffer(k);
+        id<MTLBuffer> vbuf   = ds4_metal_tensor_buffer(v);
+        id<MTLBuffer> qbuf   = ds4_metal_tensor_buffer(q);
+        id<MTLBuffer> gbuf   = ds4_metal_tensor_buffer(g);
+        id<MTLBuffer> sbuf   = ds4_metal_tensor_buffer(state);
+        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(output);
+        if (!kbuf || !vbuf || !qbuf || !gbuf || !sbuf || !outbuf) return 0;
+
+        const NSUInteger k_off   = ds4_metal_tensor_offset(k);
+        const NSUInteger v_off   = ds4_metal_tensor_offset(v);
+        const NSUInteger q_off   = ds4_metal_tensor_offset(q);
+        const NSUInteger g_off   = ds4_metal_tensor_offset(g);
+        const NSUInteger s_off   = ds4_metal_tensor_offset(state);
+        const NSUInteger out_off = ds4_metal_tensor_offset(output);
+
+        const uint64_t tok_stride = (uint64_t)S * H;
+        const uint64_t k_bytes    = tok_stride * T * sizeof(float);
+        const uint64_t s_bytes    = (uint64_t)S * S * H * n_seqs * sizeof(float);
+        const uint64_t out_bytes  = (tok_stride * T + (uint64_t)S * S * H * n_seqs) * sizeof(float);
+
+        if (ds4_metal_tensor_bytes(k) < k_bytes + k_off ||
+            ds4_metal_tensor_bytes(v) < k_bytes + v_off ||
+            ds4_metal_tensor_bytes(q) < k_bytes + q_off ||
+            ds4_metal_tensor_bytes(g) < k_bytes + g_off ||
+            ds4_metal_tensor_bytes(state) < s_bytes + s_off ||
+            ds4_metal_tensor_bytes(output) < out_bytes + out_off) {
+            fprintf(stderr, "l26f: GLA tensor size mismatch\n");
+            return 0;
+        }
+
+        // Args struct matching l26f_kargs_gla in l26f_gla.metal
+        struct {
+            int32_t ne00, ne01, ne02, ne03; int32_t nb02;
+            int32_t ne10, ne11, ne12, ne13; int32_t nb12;
+            int32_t ne20, ne21, ne22, ne23; int32_t nb22;
+            int32_t ne30, ne31, ne32, ne33; int32_t nb32;
+            int32_t ne40, ne41, ne42, ne43;
+            int32_t ne0,  ne1,  ne2,  ne3;
+            float   scale;
+        } args = {
+            S, H, T, 1, (int32_t)tok_stride,
+            S, H, T, 1, (int32_t)tok_stride,
+            S, H, T, 1, (int32_t)tok_stride,
+            S, H, T, 1, (int32_t)tok_stride,
+            S*S*H, (int32_t)n_seqs, 1, 1,
+            (int32_t)tok_stride, (int32_t)(T + S * n_seqs), 1, 1,
+            scale,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:kbuf offset:k_off atIndex:1];
+        [enc setBuffer:vbuf offset:v_off atIndex:2];
+        [enc setBuffer:qbuf offset:q_off atIndex:3];
+        [enc setBuffer:gbuf offset:g_off atIndex:4];
+        [enc setBuffer:sbuf offset:s_off atIndex:5];
+        [enc setBuffer:outbuf offset:out_off atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(S/nsg, S/4, (NSUInteger)(H * n_seqs))
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "GLA attention")) return 0;
+
+        // Copy final state from tail of output buffer back into state buffer
+        if (outbuf != sbuf || out_off + (NSUInteger)(tok_stride * T * sizeof(float)) != s_off) {
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit copyFromBuffer:outbuf
+                    sourceOffset:(NSUInteger)(out_off + tok_stride * T * sizeof(float))
+                        toBuffer:sbuf
+               destinationOffset:(NSUInteger)s_off
+                            size:(NSUInteger)s_bytes];
+            [blit endEncoding];
+        }
+
+        return ds4_metal_finish_command_buffer(cb, 0, "GLA finish");
+    }
 }
