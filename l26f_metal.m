@@ -1204,10 +1204,10 @@ static const char *ds4_metal_source =
 "\n"
 "// Q6_K: 6.6 bpw, 256 elements per block, 210 bytes\n"
 "struct block_q6_K {\n"
-"    half d;\n"
 "    uint8_t ql[128];\n"
 "    uint8_t qh[64];\n"
-"    int8_t scales[16];\n"
+"    int8_t  scales[16];\n"
+"    half d;\n"
 "};\n"
 "\n"
 "\n";
@@ -3873,6 +3873,17 @@ int ds4_metal_tensor_write(ds4_metal_tensor *tensor, uint64_t offset, const void
     if (bytes != 0) {
         memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
     }
+    return 1;
+}
+
+int ds4_metal_tensor_fill(ds4_metal_tensor *tensor, float value) {
+    if (!tensor) return 0;
+    void *ptr = ds4_metal_tensor_contents(tensor);
+    if (!ptr) return 0;
+    uint64_t bytes = ds4_metal_tensor_bytes(tensor);
+    uint64_t n = bytes / sizeof(float);
+    float *p = (float *)ptr;
+    for (uint64_t i = 0; i < n; i++) p[i] = value;
     return 1;
 }
 
@@ -14676,7 +14687,7 @@ int l26f_metal_gla(
         [enc setBuffer:gbuf offset:g_off atIndex:4];
         [enc setBuffer:sbuf offset:s_off atIndex:5];
         [enc setBuffer:outbuf offset:out_off atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(S/nsg, S/4, (NSUInteger)(H * n_seqs))
+        [enc dispatchThreadgroups:MTLSizeMake(1, S/4, (NSUInteger)(H * n_seqs))
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
         ds4_metal_end_compute_encoder(cb, enc);
 

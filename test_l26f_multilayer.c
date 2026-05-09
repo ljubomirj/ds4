@@ -44,6 +44,28 @@ typedef struct {
 
 // ---- helpers ----
 
+static float l26f_tensor_checksum(const ds4_metal_tensor *t, uint64_t bytes, int *out_nans) {
+    float *data = (float *)malloc(bytes);
+    if (!data) { *out_nans = -1; return 0.0f; }
+    ds4_metal_tensor_read(t, 0, data, bytes);
+    float sum = 0;
+    int nans = 0;
+    uint64_t n = bytes / sizeof(float);
+    for (uint64_t i = 0; i < n; i++) {
+        if (isnan(data[i])) { nans++; continue; }
+        sum += data[i];
+    }
+    free(data);
+    *out_nans = nans;
+    return sum;
+}
+
+static void l26f_checksum_print(const char *label, const ds4_metal_tensor *t, uint64_t bytes) {
+    int nans;
+    float sum = l26f_tensor_checksum(t, bytes, &nans);
+    fprintf(stderr, "    CHECKSUM %-20s  sum=%.6f  nans=%d\n", label, sum, nans);
+}
+
 static l26f_tensor *l26f_layer_tensor(const l26f_model *m, uint32_t layer, const char *suffix) {
     char name[128];
     snprintf(name, sizeof(name), "blk.%u.%s", layer, suffix);
@@ -337,11 +359,45 @@ static int l26f_moe_ffn(
         free(z);
     }
 
-    // Expert bytes per tensor
-    // All MoE weights are IQ4_NL (block_size=32, type_size=18)
-    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps->dim[1] * (wt_gate_exps->dim[0] / 32) * 18;
-    const uint64_t up_exp_bytes   = (uint64_t)wt_up_exps->dim[1]   * (wt_up_exps->dim[0]   / 32) * 18;
-    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps->dim[1] * (wt_down_exps->dim[0] / 32) * 18;
+    if (layer == 1) {
+        printf("    down_exps: ndim=%u dims=[%lu,%lu,%lu] type=%u abs_off=%lu\n",
+               wt_down_exps->ndim,
+               (unsigned long)wt_down_exps->dim[0], (unsigned long)wt_down_exps->dim[1],
+               (unsigned long)wt_down_exps->dim[2],
+               wt_down_exps->type, (unsigned long)wt_down_exps->abs_offset);
+        printf("    gate_exps: ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
+               wt_gate_exps->ndim,
+               (unsigned long)wt_gate_exps->dim[0], (unsigned long)wt_gate_exps->dim[1],
+               (unsigned long)wt_gate_exps->dim[2],
+               wt_gate_exps->type);
+        printf("    up_exps:   ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
+               wt_up_exps->ndim,
+               (unsigned long)wt_up_exps->dim[0], (unsigned long)wt_up_exps->dim[1],
+               (unsigned long)wt_up_exps->dim[2],
+               wt_up_exps->type);
+        printf("    gate_sh:   ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
+               wt_gate_sh->ndim,
+               (unsigned long)wt_gate_sh->dim[0], (unsigned long)wt_gate_sh->dim[1],
+               (unsigned long)wt_gate_sh->dim[2],
+               wt_gate_sh->type);
+        printf("    down_sh:   ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
+               wt_down_sh->ndim,
+               (unsigned long)wt_down_sh->dim[0], (unsigned long)wt_down_sh->dim[1],
+               (unsigned long)wt_down_sh->dim[2],
+               wt_down_sh->type);
+    }
+
+    // Expert bytes per tensor — use actual type block_size/type_size
+    const uint32_t gate_bs = l26f_types[wt_gate_exps->type].block_size;
+    const uint32_t gate_ts = l26f_types[wt_gate_exps->type].type_size;
+    const uint32_t up_bs   = l26f_types[wt_up_exps->type].block_size;
+    const uint32_t up_ts   = l26f_types[wt_up_exps->type].type_size;
+    const uint32_t down_bs = l26f_types[wt_down_exps->type].block_size;
+    const uint32_t down_ts = l26f_types[wt_down_exps->type].type_size;
+    // per-expert rows = dim[1], cols = dim[0], stride = dim[1] * (dim[0]/bs) * ts
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps->dim[1] * (wt_gate_exps->dim[0] / gate_bs) * gate_ts;
+    const uint64_t up_exp_bytes   = (uint64_t)wt_up_exps->dim[1]   * (wt_up_exps->dim[0]   / up_bs)   * up_ts;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps->dim[1] * (wt_down_exps->dim[0] / down_bs) * down_ts;
 
     for (int i = 0; i < 8; i++) {
         int e = selected_experts[i];
@@ -349,26 +405,26 @@ static int l26f_moe_ffn(
         uint64_t up_off   = wt_up_exps->abs_offset   + (uint64_t)e * up_exp_bytes;
         uint64_t down_off = wt_down_exps->abs_offset + (uint64_t)e * down_exp_bytes;
 
-        // Expert gate matvec
+        // Expert gate matvec: [n_embd → n_ff_exp]
         if (!l26f_metal_matvec_quant(c->ffn_gate, c->ffn_normed,
                 m->map, m->size, gate_off,
-                wt_gate_exps->dim[0], wt_gate_exps->dim[1], wt_gate_exps->type, 1))
+                n_embd, n_ff_exp, wt_gate_exps->type, 1))
             return 0;
 
-        // Expert up matvec
+        // Expert up matvec: [n_embd → n_ff_exp]
         if (!l26f_metal_matvec_quant(c->ffn_up, c->ffn_normed,
                 m->map, m->size, up_off,
-                wt_up_exps->dim[0], wt_up_exps->dim[1], wt_up_exps->type, 1))
+                n_embd, n_ff_exp, wt_up_exps->type, 1))
             return 0;
 
         // SwiGLU
         if (!ds4_metal_swiglu_tensor(c->ffn_mid, c->ffn_gate, c->ffn_up, n_ff_exp, 0.0f, 1.0f))
             return 0;
 
-        // Expert down matvec
+        // Expert down matvec: [n_ff_exp → n_embd]
         if (!l26f_metal_matvec_quant(c->ffn_down, c->ffn_mid,
                 m->map, m->size, down_off,
-                wt_down_exps->dim[0], wt_down_exps->dim[1], wt_down_exps->type, 1))
+                n_ff_exp, n_embd, wt_down_exps->type, 1))
             return 0;
 
         // Debug: check expert output for NaN
@@ -487,7 +543,7 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     const uint64_t gla_state_bytes = (uint64_t)S * S * H * sizeof(float);
     const uint64_t gla_out_bytes = act_bytes + gla_state_bytes;
 
-    // Allocate compute buffers
+    // Allocate compute buffers (zeroed — Metal shared memory is uninitialized)
     s->comp.normed      = ds4_metal_tensor_alloc(act_bytes);
     s->comp.qkv         = ds4_metal_tensor_alloc(qkv_bytes);
     s->comp.gate_out    = ds4_metal_tensor_alloc(act_bytes);
@@ -502,10 +558,27 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     s->comp.moe_out     = ds4_metal_tensor_alloc(act_bytes);
     s->comp.shexp_out   = ds4_metal_tensor_alloc(act_bytes);
 
-    // Hidden state (ping-pong between layers)
     s->hidden         = ds4_metal_tensor_alloc(act_bytes);
     s->output_normed  = ds4_metal_tensor_alloc(act_bytes);
     s->logits         = ds4_metal_tensor_alloc((uint64_t)m->n_vocab * sizeof(float));
+
+    // Zero all compute buffers to eliminate uninitialized-memory non-determinism
+    ds4_metal_tensor_fill(s->comp.normed,      0.0f);
+    ds4_metal_tensor_fill(s->comp.qkv,         0.0f);
+    ds4_metal_tensor_fill(s->comp.gate_out,    0.0f);
+    ds4_metal_tensor_fill(s->comp.gla_out,     0.0f);
+    ds4_metal_tensor_fill(s->comp.attn_proj,   0.0f);
+    ds4_metal_tensor_fill(s->comp.post_attn,   0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_normed,  0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_gate,    0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_up,      0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_mid,     0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_down,    0.0f);
+    ds4_metal_tensor_fill(s->comp.moe_out,     0.0f);
+    ds4_metal_tensor_fill(s->comp.shexp_out,   0.0f);
+    ds4_metal_tensor_fill(s->hidden,           0.0f);
+    ds4_metal_tensor_fill(s->output_normed,    0.0f);
+    ds4_metal_tensor_fill(s->logits,           0.0f);
 
     // GLA states for all GLA layers (28 layers: all except 7, 15, 23, 31)
     for (uint32_t i = 0; i < 32; i++) {
@@ -672,6 +745,18 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        // Checksum layer 0 intermediate tensors to pinpoint non-determinism
+        if (il == 0) {
+            const uint64_t act_bytes = (uint64_t)model.n_embd * sizeof(float);
+            l26f_checksum_print("hidden_in",       inp, act_bytes);
+            l26f_checksum_print("post_attn_out",    out, act_bytes);
+            l26f_checksum_print("comp.normed",      session.comp.normed, act_bytes);
+            l26f_checksum_print("comp.qkv",         session.comp.qkv, 3ULL * act_bytes);
+            l26f_checksum_print("comp.gate_out",    session.comp.gate_out, act_bytes);
+            l26f_checksum_print("comp.gla_out",     session.comp.gla_out, act_bytes);
+            l26f_checksum_print("comp.attn_proj",   session.comp.attn_proj, act_bytes);
+        }
+
         // FFN
         if (il == 0) {
             printf("  layer %u: GLA + dense FFN\n", il);
@@ -679,6 +764,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Dense FFN layer 0 failed\n");
                 return 1;
             }
+            const uint64_t act_bytes = (uint64_t)model.n_embd * sizeof(float);
+            const uint64_t ffn_bytes = (uint64_t)model.n_ff * sizeof(float);
+            l26f_checksum_print("ffn_normed",   session.comp.ffn_normed, act_bytes);
+            l26f_checksum_print("ffn_gate",     session.comp.ffn_gate, ffn_bytes);
+            l26f_checksum_print("ffn_up",       session.comp.ffn_up, ffn_bytes);
+            l26f_checksum_print("ffn_mid",      session.comp.ffn_mid, ffn_bytes);
+            l26f_checksum_print("ffn_down",     session.comp.ffn_down, act_bytes);
+            l26f_checksum_print("hidden_out",   session.hidden, act_bytes);
         } else {
             printf("  layer %u: GLA + MoE FFN\n", il);
             if (!l26f_moe_ffn(&session, il, out, session.hidden)) {
@@ -703,6 +796,14 @@ int main(int argc, char **argv) {
     }
 
     printf("Output projection...\n");
+
+    l26f_tensor *wt_out  = l26f_model_find_tensor(&model, "output.weight");
+    if (wt_out) {
+        printf("  output.weight: ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
+               wt_out->ndim,
+               (unsigned long)wt_out->dim[0], (unsigned long)wt_out->dim[1],
+               (unsigned long)wt_out->dim[2], wt_out->type);
+    }
 
     // Debug: check hidden state before output
     {

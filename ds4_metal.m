@@ -3838,6 +3838,17 @@ int ds4_metal_tensor_write(ds4_metal_tensor *tensor, uint64_t offset, const void
     return 1;
 }
 
+int ds4_metal_tensor_fill(ds4_metal_tensor *tensor, float value) {
+    if (!tensor) return 0;
+    void *ptr = ds4_metal_tensor_contents(tensor);
+    if (!ptr) return 0;
+    uint64_t bytes = ds4_metal_tensor_bytes(tensor);
+    uint64_t n = bytes / sizeof(float);
+    float *p = (float *)ptr;
+    for (uint64_t i = 0; i < n; i++) p[i] = value;
+    return 1;
+}
+
 int ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
     const DS4MetalTensor *obj = ds4_metal_tensor_const_obj(tensor);

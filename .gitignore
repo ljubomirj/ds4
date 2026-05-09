@@ -11,3 +11,6 @@
 /misc/
 .*.swp
 test_l26f
+*~
+.*.s[wv]?
+.viminfo
