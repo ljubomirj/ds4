@@ -1210,6 +1210,10 @@ static const char *ds4_metal_source =
 "    half d;\n"
 "};\n"
 "\n"
+"_Static_assert(sizeof(struct block_iq4_nl) == 18, \"IQ4_NL block must be 18 bytes\");\n"
+"_Static_assert(sizeof(struct block_q5_K)   == 176, \"Q5_K block must be 176 bytes\");\n"
+"_Static_assert(sizeof(struct block_q6_K)   == 210, \"Q6_K block must be 210 bytes\");\n"
+"\n"
 "\n";
 
 static NSString *ds4_metal_full_source(void) {
@@ -14930,8 +14934,10 @@ int l26f_metal_matvec_quant(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(src1) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(dst) atIndex:3];
+            NSUInteger tg_size = [pipeline maxTotalThreadsPerThreadgroup];
+            if (tg_size > 256) tg_size = 256;
             [enc dispatchThreads:MTLSizeMake((NSUInteger)out_dim, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+               threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
             ds4_metal_end_compute_encoder(cb, enc);
             return ds4_metal_finish_command_buffer(cb, owned, kernel_name);
         }

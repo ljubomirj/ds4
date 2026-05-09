@@ -3,9 +3,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 #include "l26f.h"
 #include "l26f_metal.h"
 #include "ds4_metal.h"
+#include "l26f_tokenizer.h"
+
+// Forward declaration for MLA CPU implementation
+typedef struct l26f_mla_kv_cache l26f_mla_kv_cache;
+extern l26f_mla_kv_cache *l26f_mla_kv_cache_alloc(int max_seq, int kv_dim);
+extern void l26f_mla_kv_cache_free(l26f_mla_kv_cache *c);
+extern int l26f_mla_layer_cpu(l26f_model *m, uint32_t layer, int position,
+    l26f_mla_kv_cache *kv_cache, const float *hidden_cpu, float *hidden_out_cpu);
 
 // ---- Per-layer compute buffer set ----
 // Reused across layers to avoid excessive allocation.
@@ -37,6 +46,7 @@ typedef struct {
     l26f_model *model;
     l26f_compute comp;
     l26f_gla_state gla_states[32];
+    l26f_mla_kv_cache *mla_kv[32];  // MLA KV caches (only layers 7,15,23,31)
     ds4_metal_tensor *hidden;
     ds4_metal_tensor *output_normed;
     ds4_metal_tensor *logits;
@@ -592,6 +602,14 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
         }
     }
 
+    // MLA KV caches for MLA layers (7, 15, 23, 31)
+    const uint32_t kv_dim = m->kv_lora_rank + m->n_rot;  // 512 + 64 = 576
+    for (uint32_t i = 0; i < 32; i++) {
+        if (!m->is_mla[i]) continue;
+        s->mla_kv[i] = l26f_mla_kv_cache_alloc(4096, kv_dim);
+        if (!s->mla_kv[i]) { fprintf(stderr, "l26f: OOM MLA KV cache %u\n", i); return 0; }
+    }
+
     if (!s->comp.normed || !s->comp.qkv || !s->comp.gate_out ||
         !s->comp.gla_out || !s->comp.attn_proj || !s->comp.post_attn ||
         !s->comp.ffn_normed || !s->comp.ffn_gate || !s->comp.ffn_up ||
@@ -624,6 +642,8 @@ static void l26f_session_free(l26f_session *s) {
     for (uint32_t i = 0; i < 32; i++) {
         if (s->gla_states[i].state)
             ds4_metal_tensor_free(s->gla_states[i].state);
+        if (s->mla_kv[i])
+            l26f_mla_kv_cache_free(s->mla_kv[i]);
     }
 }
 
@@ -701,12 +721,99 @@ static int32_t l26f_argmax(l26f_session *s) {
     return best;
 }
 
+static int l26f_forward_pass(l26f_session *session, l26f_model *model, int position, bool verbose) {
+    for (uint32_t il = 0; il < 32; il++) {
+        if (model->is_mla[il]) {
+            const uint64_t act_bytes = (uint64_t)model->n_embd * sizeof(float);
+            float *hidden_cpu = (float *)malloc(act_bytes);
+            float *hidden_out = (float *)malloc(act_bytes);
+            ds4_metal_tensor_read(session->hidden, 0, hidden_cpu, act_bytes);
+            if (!l26f_mla_layer_cpu(model, il, position, session->mla_kv[il],
+                                     hidden_cpu, hidden_out)) {
+                fprintf(stderr, "MLA layer %u failed\n", il);
+                free(hidden_cpu); free(hidden_out);
+                return 0;
+            }
+            ds4_metal_tensor *out = session->comp.post_attn;
+            ds4_metal_tensor_write(out, 0, hidden_out, act_bytes);
+            ds4_metal_tensor_write(session->hidden, 0, hidden_out, act_bytes);
+            free(hidden_cpu); free(hidden_out);
+
+            if (!l26f_moe_ffn(session, il, out, session->hidden)) {
+                fprintf(stderr, "MoE FFN layer %u failed\n", il);
+                return 0;
+            }
+            if (verbose) printf("  layer %u: MLA + MoE\n", il);
+            continue;
+        }
+
+        ds4_metal_tensor *inp = session->hidden;
+        ds4_metal_tensor *out = session->comp.post_attn;
+
+        if (!l26f_gla_layer(session, il, inp, out)) {
+            fprintf(stderr, "GLA layer %u failed\n", il);
+            return 0;
+        }
+
+        if (il == 0) {
+            if (!l26f_dense_ffn(session, out, session->hidden)) {
+                fprintf(stderr, "Dense FFN layer 0 failed\n");
+                return 0;
+            }
+            if (verbose) printf("  layer %u: GLA + dense FFN\n", il);
+        } else {
+            if (!l26f_moe_ffn(session, il, out, session->hidden)) {
+                fprintf(stderr, "MoE FFN layer %u failed\n", il);
+                return 0;
+            }
+            if (verbose && il < 8) printf("  layer %u: GLA + MoE\n", il);
+        }
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf> [token_id]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> [prompt_or_token] [n_gen]\n", argv[0]);
+        fprintf(stderr, "  If prompt starts with a digit, treated as token ID\n");
+        fprintf(stderr, "  Otherwise, tokenized as text\n");
         return 1;
     }
-    int start_token = argc > 2 ? atoi(argv[2]) : 1;
+
+    printf("Loading tokenizer...\n");
+    l26f_tokenizer *tok = l26f_tokenizer_open(argv[1]);
+    if (!tok) { fprintf(stderr, "Tokenizer load failed\n"); return 1; }
+    printf("  vocab: %u tokens, %u merges, BOS=%d EOS=%d\n",
+           tok->n_tokens, tok->n_merges, tok->bos_id, tok->eos_id);
+
+    int32_t start_token;
+    bool is_text = false;
+    if (argc > 2) {
+        // Check if argument is all digits → token ID, else text
+        const char *arg = argv[2];
+        is_text = false;
+        for (int i = 0; arg[i]; i++) {
+            if (!isdigit((unsigned char)arg[i]) && arg[i] != '-') { is_text = true; break; }
+        }
+        if (is_text) {
+            int32_t encoded[256];
+            int n = l26f_text_encode(tok, arg, encoded, 256);
+            if (n == 0) { fprintf(stderr, "Encoding failed\n"); return 1; }
+            start_token = encoded[0];
+            printf("  encoded '%s' → %d tokens, using first: %d\n", arg, n, start_token);
+        } else {
+            start_token = atoi(argv[2]);
+        }
+    } else {
+        start_token = 1;
+    }
+    int n_gen = argc > 3 ? atoi(argv[3]) : 16;
+
+    char tokbuf[256];
+    l26f_token_decode(tok, start_token, tokbuf, sizeof(tokbuf));
+    printf("Starting from token %d (%s), generating %d tokens\n", start_token, tokbuf, n_gen);
+
+    int32_t *generated = (int32_t *)malloc(n_gen * sizeof(int32_t));
 
     printf("Loading model...\n");
     l26f_model model;
@@ -730,110 +837,58 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Embed failed\n"); return 1;
     }
 
-    printf("Running 32 transformer layers...\n");
-    for (uint32_t il = 0; il < 32; il++) {
-        if (model.is_mla[il]) {
-            printf("  layer %u: MLA (skipped, passing through)\n", il);
-            continue;
-        }
+    printf("Generating %d tokens from token %d...\n", n_gen, start_token);
+    int32_t current_token = start_token;
 
-        ds4_metal_tensor *inp = session.hidden;
-        ds4_metal_tensor *out = session.comp.post_attn;
+    for (int gen = 0; gen < n_gen; gen++) {
+        printf("\n--- Token %d (input=%d) ---\n", gen, current_token);
 
-        if (!l26f_gla_layer(&session, il, inp, out)) {
-            fprintf(stderr, "GLA layer %u failed\n", il);
+        bool verbose = (gen < 2);
+        if (!l26f_forward_pass(&session, &model, gen, verbose)) {
+            fprintf(stderr, "Forward pass %d failed\n", gen);
             return 1;
         }
 
-        // Checksum layer 0 intermediate tensors to pinpoint non-determinism
-        if (il == 0) {
-            const uint64_t act_bytes = (uint64_t)model.n_embd * sizeof(float);
-            l26f_checksum_print("hidden_in",       inp, act_bytes);
-            l26f_checksum_print("post_attn_out",    out, act_bytes);
-            l26f_checksum_print("comp.normed",      session.comp.normed, act_bytes);
-            l26f_checksum_print("comp.qkv",         session.comp.qkv, 3ULL * act_bytes);
-            l26f_checksum_print("comp.gate_out",    session.comp.gate_out, act_bytes);
-            l26f_checksum_print("comp.gla_out",     session.comp.gla_out, act_bytes);
-            l26f_checksum_print("comp.attn_proj",   session.comp.attn_proj, act_bytes);
+        if (!l26f_output_logits(&session)) {
+            fprintf(stderr, "Output projection failed\n"); return 1;
         }
 
-        // FFN
-        if (il == 0) {
-            printf("  layer %u: GLA + dense FFN\n", il);
-            if (!l26f_dense_ffn(&session, out, session.hidden)) {
-                fprintf(stderr, "Dense FFN layer 0 failed\n");
-                return 1;
-            }
-            const uint64_t act_bytes = (uint64_t)model.n_embd * sizeof(float);
-            const uint64_t ffn_bytes = (uint64_t)model.n_ff * sizeof(float);
-            l26f_checksum_print("ffn_normed",   session.comp.ffn_normed, act_bytes);
-            l26f_checksum_print("ffn_gate",     session.comp.ffn_gate, ffn_bytes);
-            l26f_checksum_print("ffn_up",       session.comp.ffn_up, ffn_bytes);
-            l26f_checksum_print("ffn_mid",      session.comp.ffn_mid, ffn_bytes);
-            l26f_checksum_print("ffn_down",     session.comp.ffn_down, act_bytes);
-            l26f_checksum_print("hidden_out",   session.hidden, act_bytes);
-        } else {
-            printf("  layer %u: GLA + MoE FFN\n", il);
-            if (!l26f_moe_ffn(&session, il, out, session.hidden)) {
-                fprintf(stderr, "MoE FFN layer %u failed\n", il);
-                return 1;
-            }
-        }
+        int32_t next_token = l26f_argmax(&session);
+        l26f_token_decode(tok, next_token, tokbuf, sizeof(tokbuf));
+        printf("  -> token %d: \"%s\"\n", next_token, tokbuf);
+        generated[gen] = next_token;
 
         {
             float *h = (float *)malloc((uint64_t)model.n_embd * sizeof(float));
             ds4_metal_tensor_read(session.hidden, 0, h, (uint64_t)model.n_embd * sizeof(float));
-            float sum = 0, mn = h[0], mx = h[0]; int nans = 0;
+            float sum = 0; int nans = 0;
             for (uint32_t i = 0; i < model.n_embd; i++) {
-                if (isnan(h[i])) { nans++; continue; }
+                if (isnan(h[i])) nans++;
                 sum += h[i];
-                if (h[i] < mn) mn = h[i];
-                if (h[i] > mx) mx = h[i];
             }
-            printf("    -> sum=%.3f min=%.3f max=%.3f nans=%d\n", sum, mn, mx, nans);
+            if (nans > 0 || verbose) printf("  hidden: sum=%.3f nans=%d\n", sum, nans);
             free(h);
         }
-    }
 
-    printf("Output projection...\n");
+        current_token = next_token;
 
-    l26f_tensor *wt_out  = l26f_model_find_tensor(&model, "output.weight");
-    if (wt_out) {
-        printf("  output.weight: ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
-               wt_out->ndim,
-               (unsigned long)wt_out->dim[0], (unsigned long)wt_out->dim[1],
-               (unsigned long)wt_out->dim[2], wt_out->type);
-    }
-
-    // Debug: check hidden state before output
-    {
-        float *h = (float *)malloc((uint64_t)model.n_embd * sizeof(float));
-        ds4_metal_tensor_read(session.hidden, 0, h, (uint64_t)model.n_embd * sizeof(float));
-        float sum = 0; int nans = 0;
-        for (uint32_t i = 0; i < model.n_embd; i++) {
-            if (isnan(h[i])) nans++;
-            sum += h[i];
+        // Embed next token for next iteration
+        if (gen + 1 < n_gen) {
+            if (!l26f_embed_token(&session, (uint32_t)current_token)) {
+                fprintf(stderr, "Embed failed for token %d\n", current_token);
+                return 1;
+            }
         }
-        printf("  hidden before output: sum=%.3f nans=%d/%u\n", sum, nans, model.n_embd);
-        free(h);
     }
 
-    if (!l26f_output_logits(&session)) {
-        fprintf(stderr, "Output projection failed\n"); return 1;
-    }
-
-    int32_t next_token = l26f_argmax(&session);
-    printf("\nResult: token %d -> next_token %d\n", start_token, next_token);
-
-    float *logits_sample = (float *)malloc(10 * sizeof(float));
-    ds4_metal_tensor_read(session.logits, 0, logits_sample, 10 * sizeof(float));
-    printf("First 10 logits: ");
-    for (int i = 0; i < 10; i++) printf("%.4f ", logits_sample[i]);
-    printf("\n");
-    free(logits_sample);
+    printf("\nFull text: ");
+    l26f_text_decode(tok, generated, n_gen, tokbuf, sizeof(tokbuf));
+    printf("%s\n", tokbuf);
 
     l26f_session_free(&session);
     ds4_metal_cleanup();
     l26f_model_close(&model);
+    l26f_tokenizer_close(tok);
+    free(generated);
     return 0;
 }
