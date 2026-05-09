@@ -24,6 +24,8 @@ typedef struct {
     ds4_metal_tensor *ffn_up;
     ds4_metal_tensor *ffn_mid;
     ds4_metal_tensor *ffn_down;
+    ds4_metal_tensor *moe_out;      // accumulated MoE output
+    ds4_metal_tensor *shexp_out;    // shared expert output
 } l26f_compute;
 
 // GLA state: one per GLA layer, persists across tokens
@@ -167,6 +169,311 @@ static int l26f_dense_ffn(
     return 1;
 }
 
+// ---- MoE FFN ----
+//
+// Routing algorithm (from llama.cpp build_moe_ffn):
+// 1. logits = gate_inp × hidden  (F32 matvec, [4096]×[4096,256]→[256])
+// 2. Add exp_probs_b bias
+// 3. probs = softmax(logits)
+// 4. Group scoring: 8 groups × 32 experts, score = sum(top-2 probs per group)
+// 5. Select top-4 groups
+// 6. Mask: only keep experts from top-4 groups
+// 7. top-8 from masked pool
+// 8. weights = probs[selected], normalize, scale by 2.5
+// 9. Run 8 experts + shared expert, weighted sum
+
+static void cpu_softmax(float *x, int n) {
+    float maxv = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > maxv) maxv = x[i];
+    float sum = 0;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - maxv); sum += x[i]; }
+    for (int i = 0; i < n; i++) x[i] /= sum;
+}
+
+static int cmp_float_desc(const void *a, const void *b) {
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa < fb) - (fa > fb);
+}
+
+static int l26f_moe_ffn(
+        l26f_session *s, uint32_t layer,
+        ds4_metal_tensor *inp, ds4_metal_tensor *out) {
+    l26f_model *m = s->model;
+    l26f_compute *c = &s->comp;
+    const uint32_t n_embd = m->n_embd;
+    const uint32_t n_ff_exp = 1024;  // expert hidden dim
+    const uint32_t n_expert = 256;
+    const uint32_t n_expert_used = 8;
+    const uint32_t n_groups = 8;
+    const uint32_t n_group_used = 4;
+    const uint32_t n_exp_per_group = n_expert / n_groups;  // 32
+    const float w_scale = 2.5f;
+
+    // Find tensors
+    l26f_tensor *wt_norm      = l26f_layer_tensor(m, layer, "ffn_norm.weight");
+    l26f_tensor *wt_gate_inp  = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
+    l26f_tensor *wt_exp_b     = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
+    l26f_tensor *wt_gate_exps = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
+    l26f_tensor *wt_up_exps   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
+    l26f_tensor *wt_down_exps = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
+    l26f_tensor *wt_gate_sh   = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
+    l26f_tensor *wt_up_sh     = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
+    l26f_tensor *wt_down_sh   = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
+    if (!wt_norm || !wt_gate_inp || !wt_gate_exps || !wt_up_exps || !wt_down_exps ||
+        !wt_gate_sh || !wt_up_sh || !wt_down_sh) {
+        fprintf(stderr, "l26f: layer %u missing MoE tensors\n", layer);
+        return 0;
+    }
+
+    // 1. RMS norm
+    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed, inp,
+            m->map, m->size, wt_norm->abs_offset, n_embd, m->rms_norm_eps))
+        return 0;
+
+    // 2. CPU-side router: read hidden, compute logits
+    float *hidden_cpu = (float *)malloc(n_embd * sizeof(float));
+    ds4_metal_tensor_read(c->ffn_normed, 0, hidden_cpu, n_embd * sizeof(float));
+
+    float logits[256];
+    float *gate_inp_data = (float *)(m->map + wt_gate_inp->abs_offset);
+    // ffn_gate_inp shape: [4096, 256] — row-major, so element [i, e] is at i*256 + e
+    for (uint32_t e = 0; e < n_expert; e++) {
+        float sum = 0;
+        for (uint32_t i = 0; i < n_embd; i++) {
+            sum += hidden_cpu[i] * gate_inp_data[i * n_expert + e];
+        }
+        logits[e] = sum;
+    }
+
+    // Add exp_probs_b bias if present
+    if (wt_exp_b) {
+        float *bias = (float *)(m->map + wt_exp_b->abs_offset);
+        for (uint32_t e = 0; e < n_expert; e++) logits[e] += bias[e];
+    }
+
+    // 3. Softmax
+    float probs[256];
+    memcpy(probs, logits, sizeof(logits));
+    cpu_softmax(probs, n_expert);
+
+    // 4. Group scoring: sum of top-2 per group
+    float group_scores[8];
+    for (uint32_t g = 0; g < n_groups; g++) {
+        float top2[2] = {0, 0};
+        for (uint32_t i = 0; i < n_exp_per_group; i++) {
+            float p = probs[g * n_exp_per_group + i];
+            if (p > top2[0]) { top2[1] = top2[0]; top2[0] = p; }
+            else if (p > top2[1]) { top2[1] = p; }
+        }
+        group_scores[g] = top2[0] + top2[1];
+    }
+
+    // 5. Select top-4 groups
+    int selected_groups[8];
+    for (int i = 0; i < 8; i++) selected_groups[i] = i;
+    // Simple selection sort for top-4
+    for (int i = 0; i < 4; i++) {
+        int best = i;
+        for (int j = i+1; j < 8; j++) {
+            if (group_scores[selected_groups[j]] > group_scores[selected_groups[best]])
+                best = j;
+        }
+        int tmp = selected_groups[i]; selected_groups[i] = selected_groups[best]; selected_groups[best] = tmp;
+    }
+
+    // 6. Mask: build masked probs (only selected groups)
+    float masked_probs[256];
+    memcpy(masked_probs, probs, sizeof(probs));
+    for (uint32_t g = 0; g < n_groups; g++) {
+        bool selected = false;
+        for (int i = 0; i < 4; i++) if (selected_groups[i] == (int)g) selected = true;
+        if (!selected) {
+            for (uint32_t i = 0; i < n_exp_per_group; i++)
+                masked_probs[g * n_exp_per_group + i] = -INFINITY;
+        }
+    }
+
+    // 7. Top-8 from masked pool
+    int selected_experts[8];
+    float selected_weights[8];
+    for (int i = 0; i < 8; i++) {
+        int best_e = 0;
+        float best_p = -INFINITY;
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (masked_probs[e] > best_p) { best_p = masked_probs[e]; best_e = (int)e; }
+        }
+        selected_experts[i] = best_e;
+        selected_weights[i] = probs[best_e];  // use original probs for weights
+        masked_probs[best_e] = -INFINITY;  // remove from pool
+    }
+
+    // 8. Normalize and scale weights
+    float wsum = 0;
+    for (int i = 0; i < 8; i++) wsum += selected_weights[i];
+    if (wsum > 1e-6f) {
+        for (int i = 0; i < 8; i++) selected_weights[i] /= wsum;
+    }
+    for (int i = 0; i < 8; i++) selected_weights[i] *= w_scale;
+
+    free(hidden_cpu);
+
+    if (layer == 4) {
+        printf("    MoE layer %u: experts=[", layer);
+        for (int i = 0; i < 8; i++) printf("%d ", selected_experts[i]);
+        printf("] weights=[");
+        for (int i = 0; i < 8; i++) printf("%.4f ", selected_weights[i]);
+        printf("]\n");
+    }
+
+    // 9. Run selected experts on GPU
+    // Zero the accumulator
+    float zero = 0.0f;
+    ds4_metal_tensor_write(c->moe_out, 0, &zero, sizeof(float));
+    // Actually need to zero the whole buffer. Use a temp zero buffer.
+    {
+        void *z = calloc(1, n_embd * sizeof(float));
+        ds4_metal_tensor_write(c->moe_out, 0, z, n_embd * sizeof(float));
+        free(z);
+    }
+
+    // Expert bytes per tensor
+    // All MoE weights are IQ4_NL (block_size=32, type_size=18)
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps->dim[1] * (wt_gate_exps->dim[0] / 32) * 18;
+    const uint64_t up_exp_bytes   = (uint64_t)wt_up_exps->dim[1]   * (wt_up_exps->dim[0]   / 32) * 18;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps->dim[1] * (wt_down_exps->dim[0] / 32) * 18;
+
+    for (int i = 0; i < 8; i++) {
+        int e = selected_experts[i];
+        uint64_t gate_off = wt_gate_exps->abs_offset + (uint64_t)e * gate_exp_bytes;
+        uint64_t up_off   = wt_up_exps->abs_offset   + (uint64_t)e * up_exp_bytes;
+        uint64_t down_off = wt_down_exps->abs_offset + (uint64_t)e * down_exp_bytes;
+
+        // Expert gate matvec
+        if (!l26f_metal_matvec_quant(c->ffn_gate, c->ffn_normed,
+                m->map, m->size, gate_off,
+                wt_gate_exps->dim[0], wt_gate_exps->dim[1], wt_gate_exps->type, 1))
+            return 0;
+
+        // Expert up matvec
+        if (!l26f_metal_matvec_quant(c->ffn_up, c->ffn_normed,
+                m->map, m->size, up_off,
+                wt_up_exps->dim[0], wt_up_exps->dim[1], wt_up_exps->type, 1))
+            return 0;
+
+        // SwiGLU
+        if (!ds4_metal_swiglu_tensor(c->ffn_mid, c->ffn_gate, c->ffn_up, n_ff_exp, 0.0f, 1.0f))
+            return 0;
+
+        // Expert down matvec
+        if (!l26f_metal_matvec_quant(c->ffn_down, c->ffn_mid,
+                m->map, m->size, down_off,
+                wt_down_exps->dim[0], wt_down_exps->dim[1], wt_down_exps->type, 1))
+            return 0;
+
+        // Debug: check expert output for NaN
+        if (layer == 1 || layer == 4) {
+            float *exp_out = (float *)malloc(n_embd * sizeof(float));
+            ds4_metal_tensor_read(c->ffn_down, 0, exp_out, n_embd * sizeof(float));
+            float sum = 0; int nans = 0;
+            for (uint32_t j = 0; j < n_embd; j++) {
+                if (isnan(exp_out[j])) nans++;
+                sum += exp_out[j];
+            }
+            if (nans > 0 || layer == 1) {
+                printf("    EXPERT %d (e=%d) DOWN: nans=%d sum=%.3f\n", i, e, nans, sum);
+            }
+            free(exp_out);
+        }
+        if (layer == 1) {
+            float *tmp = (float *)malloc(n_ff_exp * sizeof(float));
+            ds4_metal_tensor_read(c->ffn_gate, 0, tmp, n_ff_exp * sizeof(float));
+            float sum = 0; int nans = 0;
+            for (uint32_t j = 0; j < n_ff_exp; j++) { if (isnan(tmp[j])) nans++; else sum += tmp[j]; }
+            if (nans > 0) printf("    EXPERT %d gate: nans=%d sum=%.3f\n", i, nans, sum);
+            ds4_metal_tensor_read(c->ffn_up, 0, tmp, n_ff_exp * sizeof(float));
+            sum = 0; nans = 0;
+            for (uint32_t j = 0; j < n_ff_exp; j++) { if (isnan(tmp[j])) nans++; else sum += tmp[j]; }
+            if (nans > 0) printf("    EXPERT %d up: nans=%d sum=%.3f\n", i, nans, sum);
+            ds4_metal_tensor_read(c->ffn_mid, 0, tmp, n_ff_exp * sizeof(float));
+            sum = 0; nans = 0;
+            for (uint32_t j = 0; j < n_ff_exp; j++) { if (isnan(tmp[j])) nans++; else sum += tmp[j]; }
+            if (nans > 0) printf("    EXPERT %d mid: nans=%d sum=%.3f\n", i, nans, sum);
+            free(tmp);
+        }
+
+        // Accumulate weighted output: moe_out += weight * ffn_down
+        // ds4 doesn't have a weighted-add kernel. Do on CPU for now.
+        float *exp_out = (float *)malloc(n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->ffn_down, 0, exp_out, n_embd * sizeof(float));
+        float *acc = (float *)malloc(n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->moe_out, 0, acc, n_embd * sizeof(float));
+        float w = selected_weights[i];
+        for (uint32_t j = 0; j < n_embd; j++) acc[j] += w * exp_out[j];
+        ds4_metal_tensor_write(c->moe_out, 0, acc, n_embd * sizeof(float));
+        free(exp_out);
+        free(acc);
+    }
+
+    // 10. Shared expert (always runs)
+    if (!l26f_metal_matvec_quant(c->ffn_gate, c->ffn_normed,
+            m->map, m->size, wt_gate_sh->abs_offset,
+            wt_gate_sh->dim[0], wt_gate_sh->dim[1], wt_gate_sh->type, 1))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->ffn_up, c->ffn_normed,
+            m->map, m->size, wt_up_sh->abs_offset,
+            wt_up_sh->dim[0], wt_up_sh->dim[1], wt_up_sh->type, 1))
+        return 0;
+    if (!ds4_metal_swiglu_tensor(c->ffn_mid, c->ffn_gate, c->ffn_up, n_ff_exp, 0.0f, 1.0f))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->shexp_out, c->ffn_mid,
+            m->map, m->size, wt_down_sh->abs_offset,
+            wt_down_sh->dim[0], wt_down_sh->dim[1], wt_down_sh->type, 1))
+        return 0;
+
+    // Add shared expert to MoE output
+    {
+        float *moe = (float *)malloc(n_embd * sizeof(float));
+        float *sh = (float *)malloc(n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->moe_out, 0, moe, n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->shexp_out, 0, sh, n_embd * sizeof(float));
+        for (uint32_t j = 0; j < n_embd; j++) moe[j] += sh[j];
+        ds4_metal_tensor_write(c->moe_out, 0, moe, n_embd * sizeof(float));
+        free(moe);
+        free(sh);
+    }
+
+    // Debug: print moe_out magnitude before residual
+    if (layer == 1 || layer == 4) {
+        float *moe = (float *)malloc(n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->moe_out, 0, moe, n_embd * sizeof(float));
+        float sum = 0, mn = moe[0], mx = moe[0]; int nans = 0;
+        for (uint32_t i = 0; i < n_embd; i++) {
+            if (isnan(moe[i])) { nans++; continue; }
+            sum += moe[i];
+            if (moe[i] < mn) mn = moe[i];
+            if (moe[i] > mx) mx = moe[i];
+        }
+        printf("    moe_out before residual: sum=%.3f min=%.3f max=%.3f nans=%d\n", sum, mn, mx, nans);
+        free(moe);
+    }
+    // Debug shared expert output for layer 1
+    if (layer == 1) {
+        float *sh = (float *)malloc(n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->shexp_out, 0, sh, n_embd * sizeof(float));
+        float sum = 0; int nans = 0;
+        for (uint32_t i = 0; i < n_embd; i++) { if (isnan(sh[i])) nans++; else sum += sh[i]; }
+        printf("    shared expert down: sum=%.3f nans=%d\n", sum, nans);
+        free(sh);
+    }
+
+    // 11. Residual add: out = inp + moe_out
+    if (!ds4_metal_add_tensor(out, inp, c->moe_out, n_embd))
+        return 0;
+
+    return 1;
+}
+
 static int l26f_session_init(l26f_session *s, l26f_model *m) {
     memset(s, 0, sizeof(*s));
     s->model = m;
@@ -192,6 +499,8 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     s->comp.ffn_up      = ds4_metal_tensor_alloc(ffn_bytes);
     s->comp.ffn_mid     = ds4_metal_tensor_alloc(ffn_bytes);
     s->comp.ffn_down    = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.moe_out     = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.shexp_out   = ds4_metal_tensor_alloc(act_bytes);
 
     // Hidden state (ping-pong between layers)
     s->hidden         = ds4_metal_tensor_alloc(act_bytes);
@@ -234,6 +543,8 @@ static void l26f_session_free(l26f_session *s) {
     ds4_metal_tensor_free(s->comp.ffn_up);
     ds4_metal_tensor_free(s->comp.ffn_mid);
     ds4_metal_tensor_free(s->comp.ffn_down);
+    ds4_metal_tensor_free(s->comp.moe_out);
+    ds4_metal_tensor_free(s->comp.shexp_out);
     ds4_metal_tensor_free(s->hidden);
     ds4_metal_tensor_free(s->output_normed);
     ds4_metal_tensor_free(s->logits);
@@ -361,23 +672,22 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        // Dense FFN for layer 0 only
+        // FFN
         if (il == 0) {
             printf("  layer %u: GLA + dense FFN\n", il);
-            ds4_metal_tensor *ffn_in = out;
-            ds4_metal_tensor *ffn_out = session.hidden;
-            if (!l26f_dense_ffn(&session, ffn_in, ffn_out)) {
+            if (!l26f_dense_ffn(&session, out, session.hidden)) {
                 fprintf(stderr, "Dense FFN layer 0 failed\n");
                 return 1;
             }
         } else {
-            printf("  layer %u: GLA (MoE FFN skipped)\n", il);
-            ds4_metal_tensor_copy(session.hidden, 0,
-                session.comp.post_attn, 0,
-                (uint64_t)model.n_embd * sizeof(float));
+            printf("  layer %u: GLA + MoE FFN\n", il);
+            if (!l26f_moe_ffn(&session, il, out, session.hidden)) {
+                fprintf(stderr, "MoE FFN layer %u failed\n", il);
+                return 1;
+            }
         }
 
-        if (il < 3 || il == 31) {
+        {
             float *h = (float *)malloc((uint64_t)model.n_embd * sizeof(float));
             ds4_metal_tensor_read(session.hidden, 0, h, (uint64_t)model.n_embd * sizeof(float));
             float sum = 0, mn = h[0], mx = h[0]; int nans = 0;
