@@ -256,3 +256,43 @@ inspecting buffer sizes — all without finding the bugs. The difference: struct
   in the Metal prefix. This would have caught the Q6_K bug at compile time.
 - **CPU reference**: No CPU-side dequantization reference exists for IQ4_NL or Q6_K.
   Writing one would allow element-by-element comparison against GPU output.
+
+## Lesson 5: Instrument Before Reasoning (2026-05-10)
+
+**Problem**: Tokenizer hung. Positions verified correct. 157K tokens < 3 MB of data.
+Hours of first-principles reasoning produced no answer.
+
+**What worked**: Added `XLOG()` macros at every checkpoint in the flow. Built, ran,
+and observed in 2 minutes. The data showed:
+
+```
+TOK: reading token 150000 / 157184          ← fast, all tokens read
+TOK: 157184 tokens read, hash map deferred   ← next line never appeared
+```
+
+The hang was **inside `calloc(314369, 16)`** — a 5 MB allocation that should take <1ms.
+Root cause: macOS VM page-table contention when a 58 GiB GGUF mmap is live.
+The kernel serializes VM operations and 5 MB calloc gets caught in the queue.
+
+**Pattern**: When a program hangs at unknown location:
+1. Add `XLOG()` at entry/exit of every function and major block
+2. Add `XLOG_EVERY(N)` inside loops
+3. Build, run, observe — 2 minutes of work
+4. The data tells you exactly where it diverges from expectation
+5. Now you have a specific line to investigate, not the whole codebase
+
+**Contrast with wrong approach**: 45 minutes reasoning about GGUF format, mmap page
+faults, string encoding, hash function collisions — all irrelevant. The problem
+was `calloc` behavior under VM pressure, which no amount of reasoning about the
+data format would have revealed.
+
+**The XLOG macro**: Defined as:
+```c
+#ifndef NDEBUG
+#define XLOG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#else
+#define XLOG(fmt, ...) ((void)0)
+#endif
+```
+Stays in source permanently. Compiles to nothing in release. Follows the
+ALL_CAPS convention for non-business-logic code.

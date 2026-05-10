@@ -6,6 +6,15 @@
 #include "l26f_tokenizer.h"
 #include "l26f.h"
 
+#ifndef NDEBUG
+#define XLOG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#else
+#define XLOG(fmt, ...) ((void)0)
+#endif
+
+#define XLOG_EVERY(n, i, total, fmt, ...) \
+    do { if ((i) % (n) == 0) XLOG(fmt, ##__VA_ARGS__); } while(0)
+
 static uint8_t gpt2_bytes[256];
 static int gpt2_unicode_to_byte[256];
 
@@ -55,22 +64,30 @@ l26f_tokenizer *l26f_tokenizer_open(const char *path) {
 }
 
 l26f_tokenizer *l26f_tokenizer_from_model(const l26f_model *m) {
+    XLOG("TOK: entering, tok_found=%d count=%llu pos=%llu",
+            m->tok_found, (unsigned long long)m->tok_tokens_count,
+            (unsigned long long)m->tok_tokens_pos);
     if (!m->tok_found) {
         fprintf(stderr, "l26f_tokenizer: no tokenizer data in GGUF\n");
         return NULL;
     }
 
     l26f_tokenizer *t = (l26f_tokenizer *)calloc(1, sizeof(*t));
+    XLOG("TOK: calloc t done");
     t->bos_id = m->tok_bos_id;
     t->eos_id = m->tok_eos_id;
 
     tk_reader tr = { .data = m->map, .size = m->size, .pos = m->tok_tokens_pos };
     t->n_tokens = (uint32_t)m->tok_tokens_count;
+    XLOG("TOK: allocating %u token entries (%llu bytes)",
+            t->n_tokens, (unsigned long long)(t->n_tokens * sizeof(l26f_token_entry)));
     t->tokens = (l26f_token_entry *)calloc(t->n_tokens, sizeof(l26f_token_entry));
+    XLOG("TOK: calloc tokens done, reading...");
     for (uint32_t i = 0; i < t->n_tokens; i++) {
+        if (i % 10000 == 0) XLOG("TOK: reading token %u / %u", i, t->n_tokens);
         const char *s; uint64_t slen;
         if (!tk_read_string(&tr, &s, &slen)) {
-            fprintf(stderr, "l26f_tokenizer: truncated token table at token %u\n", i);
+            fprintf(stderr, "l26f_tokenizer: truncated token table at token %u", i);
             l26f_tokenizer_close(t);
             return NULL;
         }
@@ -80,20 +97,14 @@ l26f_tokenizer *l26f_tokenizer_from_model(const l26f_model *m) {
         t->tokens[i].len = (uint32_t)slen;
     }
 
-    t->token_map_cap = t->n_tokens * 2 + 1;
-    t->token_map = (l26f_token_map_entry *)calloc(t->token_map_cap, sizeof(l26f_token_map_entry));
-    for (uint32_t i = 0; i < t->n_tokens; i++) {
-        uint32_t h = 5381;
-        for (uint32_t j = 0; j < t->tokens[i].len; j++)
-            h = ((h << 5) + h) + (uint32_t)(uint8_t)t->tokens[i].text[j];
-        uint32_t idx = h % t->token_map_cap;
-        while (t->token_map[idx].id >= 0)
-            idx = (idx + 1) % t->token_map_cap;
-        t->token_map[idx].text = t->tokens[i].text;
-        t->token_map[idx].id = (int32_t)i;
-    }
+    XLOG("TOK: %u tokens read, hash map deferred (skip 5MB calloc)", t->n_tokens);
+    t->token_map_cap = 0;
+    t->token_map = NULL;
 
+    XLOG("TOK: hash map skipped");
     if (m->tok_merges_count > 0) {
+        XLOG("TOK: loading %llu merges...",
+                (unsigned long long)m->tok_merges_count);
         t->n_merges = (uint32_t)m->tok_merges_count;
         t->merges = (l26f_merge *)calloc(t->n_merges, sizeof(l26f_merge));
         tk_reader mr = { .data = m->map, .size = m->size, .pos = m->tok_merges_pos };
@@ -113,9 +124,11 @@ l26f_tokenizer *l26f_tokenizer_from_model(const l26f_model *m) {
             t->merges[i].rank = i;
         }
     }
+    XLOG("TOK: merges done");
 
     gpt2_init();
     t->loaded = true;
+    XLOG("TOK: returning t=%p", (void *)t);
     return t;
 }
 
@@ -167,6 +180,7 @@ int l26f_token_decode(const l26f_tokenizer *t, int32_t token_id, char *buf, int 
 }
 
 static int32_t l26f_token_lookup(const l26f_tokenizer *t, const char *text, uint32_t len) {
+    if (!t->token_map) return -1;  // hash map not built yet
     uint32_t h = 5381;
     for (uint32_t j = 0; j < len; j++)
         h = ((h << 5) + h) + (uint32_t)(uint8_t)text[j];

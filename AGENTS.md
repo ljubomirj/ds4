@@ -43,16 +43,17 @@ docs/                        All design, status, and convention documents
 | `08-current-status.md` | ~ | MLA plan forming |
 | `11-status-tasks-complete.md` | 2026-05-09 | All 32 layers working, multi-token gen |
 | `12-status-tokenizer-partial.md` | 2026-05-10 | Tokenizer integration partial |
+| `15-status-tokenizer-working.md` | 2026-05-10 | Tokenizer working, text gen live, hash map deferred |
 
 ### Reference Documents
 
 | File | Purpose |
 |------|---------|
 | `07-manifesto.md` | 12 engineering rules (zero-fill, checksums, static asserts) |
-| `09-lessons-learned.md` | Debugging timeline, what worked/didn't |
+| `09-lessons-learned.md` | Debugging timeline, **Lesson 5: instrument before reasoning** |
 | `10-mla-plan.md` | MLA data flow, absorption trick, RoPE |
 | `13-naming-conventions.md` | Dimension-annotated variable names (`_NxM`, `_1xCR`) |
-| `14-code-style.md` | ALL_CAPS for non-business-logic, 0xC9 memory fill |
+| `14-code-style.md` | ALL_CAPS for non-business-logic, 0xC9 memory fill, XLOG pattern |
 
 ### Reference Code
 
@@ -65,12 +66,15 @@ docs/                        All design, status, and convention documents
 **Working**: All 32 layers end-to-end, zero NaNs, fully deterministic.
 Multi-token auto-regressive generation with argmax selection.
 GLA + MLA (CPU-only) + MoE FFN with correct expert routing and per-type byte strides.
+**Tokenizer** loads tokens + merges in ~2s, decodes token IDs to text.
+**Text generation** works: prompt token → generate → decode → print.
 
-**Partial**: Tokenizer loads metadata positions correctly but hangs during token
-string allocation loop (157K tokens). See `12-status-tokenizer-partial.md`.
+**Partial**: Text encode (text→tokens) needs hash map lookup.
+Hash map construction (`calloc 5MB`) stalls under 58 GiB mmap — macOS VM issue.
+GPT-2 byte token rendering has artifacts (raw bytes in output).
 
-**Not yet**: Text I/O (blocked on tokenizer fix), GPU-accelerated MLA,
-sampling (temperature/top-k/top-p), prefill, benchmarking.
+**Not yet**: GPU-accelerated MLA, sampling (temperature/top-k/top-p),
+prefill, benchmarking, text prompt input.
 
 ## Key Dimensions (Ling-2.6-flash)
 
@@ -105,6 +109,19 @@ See `docs/13-naming-conventions.md` for the full suffix system.
 - Time-dependent info goes in `docs/##_description.md` with ever-increasing numeric prefix.
 - Conventions and reference docs go in `docs/` with descriptive names.
 - AGENTS.md (this file) is the authoritative index of everything in docs/.
+
+## Debugging Pattern: XLOG Before Reasoning
+
+When something hangs or produces wrong output:
+
+1. Add `XLOG()` at entry/exit of suspect functions and after major blocks
+2. Add `XLOG_EVERY(10000, i, total, ...)` inside large loops
+3. `make clean && make`, run, observe stderr
+4. The data tells you exactly where behavior diverges from expectation
+5. Now investigate that one line — not the whole codebase
+
+See `docs/09-lessons-learned.md` Lesson 5 for the full story.
+See `docs/14-code-style.md` for XLOG macro definition and conventions.
 
 ## Build
 
