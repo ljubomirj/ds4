@@ -6,6 +6,14 @@
 #include <math.h>
 #include "l26f.h"
 
+// Debug checksum helper
+static void cpu_ckpt_sum(const float *d, int n, const char *label, uint32_t layer) {
+    if (!d || n == 0) return;
+    float sum = 0;
+    for (int i = 0; i < n; i++) sum += d[i];
+    if (layer == 7) fprintf(stderr, "    MLA-CPU L%u %-20s sum=%.6f\n", layer, label, sum);
+}
+
 // ---- Quantization constants ----
 
 #define QK_K  256
@@ -292,15 +300,19 @@ int l26f_mla_layer_cpu(
 
     const float *w_norm_1xN = (const float *)(model_base + t_attn_norm_N->abs_offset);
     cpu_rms_norm(hidden_cpu, w_norm_1xN, normed_1xN, n_embd, eps);
+    cpu_ckpt_sum(normed_1xN, n_embd, "normed", layer);
 
     cpu_matvec(model_base + t_q_a_NxQ->abs_offset, normed_1xN, q_a_1xQ,
                t_q_a_NxQ->type, q_lora_rank, n_embd);
+    cpu_ckpt_sum(q_a_1xQ, q_lora_rank, "q_a", layer);
 
     const float *w_q_a_norm_1xQ = (const float *)(model_base + t_q_a_norm_Q->abs_offset);
     cpu_rms_norm(q_a_1xQ, w_q_a_norm_1xQ, q_a_normed_1xQ, q_lora_rank, eps);
+    cpu_ckpt_sum(q_a_normed_1xQ, q_lora_rank, "q_a_normed", layer);
 
     cpu_matvec(model_base + t_q_b_QxHxD->abs_offset, q_a_normed_1xQ, q_b_1xHxD,
                t_q_b_QxHxD->type, n_head * head_dim, q_lora_rank);
+    cpu_ckpt_sum(q_b_1xHxD, n_head * head_dim, "q_b", layer);
 
     // Split Q into q_nope [n_head, qk_nope] and q_pe [n_head, n_rot]
     // q_b layout: [n_head * head_dim] = for each head, first qk_nope=128 then n_rot=64
@@ -312,17 +324,28 @@ int l26f_mla_layer_cpu(
         float *q_pe_h_R = q_b_1xHxD + h * head_dim + qk_nope;
         cpu_rope(q_pe_h_R, n_rot, position, m->rope_theta);
     }
+    // Note: q_pe is now in-place in q_b after rope. Checksum q_pe portion.
+    {
+        float q_pe_sum = 0;
+        for (uint32_t h = 0; h < n_head; h++)
+            for (uint32_t d = 0; d < n_rot; d++)
+                q_pe_sum += q_b_1xHxD[h * head_dim + qk_nope + d];
+        cpu_ckpt_sum(&q_pe_sum, 1, "q_pe_roped", layer);
+    }
 
     cpu_matvec(model_base + t_kv_a_mqa_NxCR->abs_offset, normed_1xN, kv_a_1xCR,
                t_kv_a_mqa_NxCR->type, kv_dim, n_embd);
+    cpu_ckpt_sum(kv_a_1xCR, kv_dim, "kv_a", layer);
 
     memcpy(kv_cmpr_1xC, kv_a_1xCR, kv_lora_rank * sizeof(float));
     float *k_pe_R = kv_a_1xCR + kv_lora_rank;
 
     const float *w_kv_a_norm_1xC = (const float *)(model_base + t_kv_a_norm_C->abs_offset);
     cpu_rms_norm(kv_cmpr_1xC, w_kv_a_norm_1xC, kv_cmpr_1xC, kv_lora_rank, eps);
+    cpu_ckpt_sum(kv_cmpr_1xC, kv_lora_rank, "kv_cmpr_normed", layer);
 
     cpu_rope(k_pe_R, n_rot, position, m->rope_theta);
+    cpu_ckpt_sum(k_pe_R, n_rot, "k_pe_roped", layer);
 
     // 4. Absorption: q_absorbed[h] = wk_b[:,:,h] × q_nope[:,h]
     // wk_b: [qk_nope, kv_lora_rank, n_head] (dim[0]=128, dim[1]=512, dim[2]=32)
@@ -339,6 +362,7 @@ int l26f_mla_layer_cpu(
         }
         free(row_buf);
     }
+    cpu_ckpt_sum(q_absorbed_HxC, n_head * kv_lora_rank, "q_absorbed", layer);
 
     {
         float *k_new_1xCR = kv_cache->data_TxCR + (uint64_t)kv_cache->n_tokens * kv_dim;
@@ -379,6 +403,7 @@ int l26f_mla_layer_cpu(
             }
         }
     }
+    cpu_ckpt_sum(attn_result_HxC, n_head * kv_lora_rank, "attn_result", layer);
 
     {
         const uint64_t head_bytes = (uint64_t)(t_v_b_CxPxH->dim[1]) * cpu_row_bytes(t_v_b_CxPxH->type, t_v_b_CxPxH->dim[0]);
@@ -386,15 +411,17 @@ int l26f_mla_layer_cpu(
             const uint8_t *wv_b_h_CxP = model_base + t_v_b_CxPxH->abs_offset + h * head_bytes;
             const float *attn_h_1xC = attn_result_HxC + h * kv_lora_rank;
             cpu_matvec(wv_b_h_CxP, attn_h_1xC, v_decomp_HxP + h * 128,
-                       t_v_b_CxPxH->type, t_v_b_CxPxH->dim[1], t_v_b_CxPxH->dim[0]);
+                        t_v_b_CxPxH->type, t_v_b_CxPxH->dim[1], t_v_b_CxPxH->dim[0]);
         }
     }
+    cpu_ckpt_sum(v_decomp_HxP, n_head * 128, "v_decomp", layer);
 
     for (uint32_t h = 0; h < n_head; h++) {
         memcpy(out_proj_in_1xN + h * 128, v_decomp_HxP + h * 128, 128 * sizeof(float));
     }
     cpu_matvec(model_base + t_output_NxN->abs_offset, out_proj_in_1xN, attn_proj_1xN,
                t_output_NxN->type, n_embd, n_embd);
+    cpu_ckpt_sum(attn_proj_1xN, n_embd, "attn_proj", layer);
 
     for (uint32_t i = 0; i < n_embd; i++) {
         hidden_out_cpu[i] = hidden_cpu[i] + attn_proj_1xN[i];
