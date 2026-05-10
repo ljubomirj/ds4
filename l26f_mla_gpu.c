@@ -25,7 +25,13 @@
 #include "l26f_metal.h"
 #include "ds4_metal.h"
 
-// Debug checksum helper
+// Debug checksum helper — only reads GPU when L26F_MLA_DEBUG is defined
+#ifndef L26F_MLA_DEBUG
+static float mla_ckpt_sum(const ds4_metal_tensor *t, uint64_t bytes, const char *label, uint32_t layer) {
+    (void)t; (void)bytes; (void)label; (void)layer;
+    return 0.0f;
+}
+#else
 static float mla_ckpt_sum(const ds4_metal_tensor *t, uint64_t bytes, const char *label, uint32_t layer) {
     if (!t || bytes == 0) return 0.0f;
     float *d = (float *)malloc(bytes);
@@ -37,6 +43,7 @@ static float mla_ckpt_sum(const ds4_metal_tensor *t, uint64_t bytes, const char 
     free(d);
     return sum;
 }
+#endif
 
 // ---- MLA KV cache (CPU-side, copied to GPU for attention) ----
 

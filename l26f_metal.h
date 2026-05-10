@@ -161,4 +161,11 @@ int l26f_metal_batch_iq4_nl_matvec(
     uint64_t                 head_stride,
     const ds4_metal_tensor *input);
 
+// AXPY: dst[i] += alpha * src[i]
+int l26f_metal_axpy(
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src,
+    float                   alpha,
+    uint32_t                n);
+
 #endif

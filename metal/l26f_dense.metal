@@ -251,3 +251,16 @@ kernel void kernel_mul_mv_q6_K_f32(
     }
     dst[r0] = sum;
 }
+
+// AXPY: dst[i] += alpha * src[i]
+kernel void kernel_l26f_axpy(
+        device        float * dst   [[buffer(0)]],
+        device  const float * src   [[buffer(1)]],
+        constant      float  & alpha [[buffer(2)]],
+        constant      uint   & n     [[buffer(3)]],
+        uint tg [[thread_position_in_threadgroup]],
+        uint tg_total [[threads_per_threadgroup]]) {
+    for (uint i = tg; i < n; i += tg_total) {
+        dst[i] += alpha * src[i];
+    }
+}

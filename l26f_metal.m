@@ -14696,9 +14696,8 @@ int l26f_metal_gla(
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
         ds4_metal_end_compute_encoder(cb, enc);
 
-        // Copy final state from tail of output buffer back into state buffer
-        // Do this BEFORE committing — same command buffer
         if (outbuf != sbuf || out_off + (NSUInteger)(tok_stride * T * sizeof(float)) != s_off) {
+            if (g_batch_cb && cb == g_batch_cb) ds4_metal_close_batch_encoder();
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             [blit copyFromBuffer:outbuf
                     sourceOffset:(NSUInteger)(out_off + tok_stride * T * sizeof(float))
@@ -15058,6 +15057,49 @@ int l26f_metal_batch_iq4_nl_matvec(
         ds4_metal_end_compute_encoder(cb, enc);
 
         return ds4_metal_finish_command_buffer(cb, owned, "l26f_batch_iq4_nl_matvec");
+    }
+}
+
+// =========================================================================
+// L26F: AXPY — dst[i] += alpha * src[i]
+// =========================================================================
+
+int l26f_metal_axpy(
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src,
+    float                   alpha,
+    uint32_t                n)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!dst || !src || n == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> dstbuf = ds4_metal_tensor_buffer(dst);
+        id<MTLBuffer> srcbuf = ds4_metal_tensor_buffer(src);
+        if (!dstbuf || !srcbuf) return 0;
+
+        id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline("kernel_l26f_axpy");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        NSUInteger nth = [pipeline maxTotalThreadsPerThreadgroup];
+        if (nth > 256) nth = 256;
+        if (nth > n) nth = n;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:dstbuf offset:ds4_metal_tensor_offset(dst) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_metal_tensor_offset(src) atIndex:1];
+        [enc setBytes:&alpha length:sizeof(alpha) atIndex:2];
+        [enc setBytes:&n length:sizeof(n) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth ? nth : 1, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        return ds4_metal_finish_command_buffer(cb, owned, "l26f_axpy");
     }
 }
 
