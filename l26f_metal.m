@@ -1246,6 +1246,7 @@ static NSString *ds4_metal_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"L26F_METAL_DENSE_SOURCE",     @"metal/l26f_dense.metal"],
         @[@"L26F_METAL_GLA_SOURCE",       @"metal/l26f_gla.metal"],
+        @[@"L26F_METAL_MLA_SOURCE",       @"metal/l26f_mla.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -14849,6 +14850,215 @@ static id<MTLComputePipelineState> l26f_metal_get_cached_pipeline(const char *fn
     }
     [g_pipeline_cache setObject:p forKey:key];
     return p;
+}
+
+// =========================================================================
+// L26F: MLA (Multi-head Latent Attention) kernel dispatch wrappers
+// =========================================================================
+
+int l26f_metal_rope(
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src,
+    uint32_t                n_dims,
+    int32_t                 position,
+    float                   theta)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (n_dims == 0 || (n_dims & 1) != 0) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline("kernel_l26f_rope");
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> srcbuf = ds4_metal_tensor_buffer(src);
+        id<MTLBuffer> dstbuf = ds4_metal_tensor_buffer(dst);
+        if (!srcbuf || !dstbuf) return 0;
+
+        struct {
+            int32_t n_dims;
+            int32_t position;
+            float   theta;
+        } args = { (int32_t)n_dims, position, theta };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        NSUInteger nth = [pipeline maxTotalThreadsPerThreadgroup];
+        NSUInteger needed = n_dims / 2;
+        if (nth > needed) nth = needed;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_metal_tensor_offset(src) atIndex:1];
+        [enc setBuffer:dstbuf offset:ds4_metal_tensor_offset(dst) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(needed, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth ? nth : 1, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        return ds4_metal_finish_command_buffer(cb, owned, "l26f_rope");
+    }
+}
+
+int l26f_metal_rope_batch(
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src,
+    uint32_t                n_dims,
+    uint32_t                n_vectors,
+    int32_t                 position,
+    float                   theta)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (n_dims == 0 || (n_dims & 1) != 0 || n_vectors == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline("kernel_l26f_rope_batch");
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> srcbuf = ds4_metal_tensor_buffer(src);
+        id<MTLBuffer> dstbuf = ds4_metal_tensor_buffer(dst);
+        if (!srcbuf || !dstbuf) return 0;
+
+        struct {
+            int32_t n_dims;
+            int32_t n_vectors;
+            int32_t position;
+            float   theta;
+        } args = { (int32_t)n_dims, (int32_t)n_vectors, position, theta };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        NSUInteger nth_x = [pipeline maxTotalThreadsPerThreadgroup];
+        NSUInteger needed_x = n_dims / 2;
+        if (nth_x > needed_x) nth_x = needed_x;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_metal_tensor_offset(src) atIndex:1];
+        [enc setBuffer:dstbuf offset:ds4_metal_tensor_offset(dst) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(needed_x, n_vectors, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth_x ? nth_x : 1, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        return ds4_metal_finish_command_buffer(cb, owned, "l26f_rope_batch");
+    }
+}
+
+int l26f_mla_attn(
+    ds4_metal_tensor       *attn_out,
+    const ds4_metal_tensor *q_absorbed,
+    const ds4_metal_tensor *q_pe,
+    const ds4_metal_tensor *kv_cache,
+    uint32_t                n_heads,
+    uint32_t                kv_lora_rank,
+    uint32_t                n_rot,
+    uint32_t                n_cached,
+    float                   scale)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (n_heads == 0 || kv_lora_rank == 0 || n_cached == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline("kernel_l26f_mla_attn");
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> qabs_buf = ds4_metal_tensor_buffer(q_absorbed);
+        id<MTLBuffer> qpe_buf  = ds4_metal_tensor_buffer(q_pe);
+        id<MTLBuffer> kv_buf   = ds4_metal_tensor_buffer(kv_cache);
+        id<MTLBuffer> out_buf  = ds4_metal_tensor_buffer(attn_out);
+        if (!qabs_buf || !qpe_buf || !kv_buf || !out_buf) return 0;
+
+        struct {
+            int32_t n_heads;
+            int32_t kv_lora_rank;
+            int32_t n_rot;
+            int32_t n_cached;
+            float   scale;
+        } args = { (int32_t)n_heads, (int32_t)kv_lora_rank, (int32_t)n_rot, (int32_t)n_cached, scale };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        NSUInteger nth = [pipeline maxTotalThreadsPerThreadgroup];
+        if (nth > n_heads) nth = n_heads;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qabs_buf offset:ds4_metal_tensor_offset(q_absorbed) atIndex:1];
+        [enc setBuffer:qpe_buf  offset:ds4_metal_tensor_offset(q_pe) atIndex:2];
+        [enc setBuffer:kv_buf   offset:ds4_metal_tensor_offset(kv_cache) atIndex:3];
+        [enc setBuffer:out_buf  offset:ds4_metal_tensor_offset(attn_out) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(n_heads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth ? nth : 1, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        return ds4_metal_finish_command_buffer(cb, owned, "l26f_mla_attn");
+    }
+}
+
+int l26f_metal_batch_iq4_nl_matvec(
+    ds4_metal_tensor       *dst,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 out_rows,
+    uint32_t                 n_heads,
+    uint64_t                 head_stride,
+    const ds4_metal_tensor *input)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (in_dim == 0 || out_rows == 0 || n_heads == 0 || (in_dim & 31) != 0) return 0;
+
+    const uint64_t weight_bytes = (uint64_t)n_heads * head_stride;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = l26f_metal_get_cached_pipeline("kernel_l26f_batch_iq4_nl_matvec");
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> inbuf  = ds4_metal_tensor_buffer(input);
+        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(dst);
+        if (!inbuf || !outbuf) return 0;
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+            weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        struct {
+            int32_t  n_heads;
+            int32_t  in_dim;
+            int32_t  out_rows;
+            uint64_t head_stride;
+        } args = { (int32_t)n_heads, (int32_t)in_dim, (int32_t)out_rows, head_stride };
+
+        const NSUInteger total = (NSUInteger)n_heads * (NSUInteger)out_rows;
+        NSUInteger nth = [pipeline maxTotalThreadsPerThreadgroup];
+        if (nth > total) nth = total;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:inbuf offset:ds4_metal_tensor_offset(input) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(dst) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth ? nth : 1, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        return ds4_metal_finish_command_buffer(cb, owned, "l26f_batch_iq4_nl_matvec");
+    }
 }
 
 // =========================================================================

@@ -113,4 +113,52 @@ int l26f_metal_embed_tokens(
 // Memory reporting
 void l26f_metal_print_memory_report(const char *label);
 
+// --- MLA Kernels ---
+
+// RoPE: apply rotary position embedding to a single vector [n_dims]
+int l26f_metal_rope(
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src,
+    uint32_t                n_dims,
+    int32_t                 position,
+    float                   theta);
+
+// RoPE batched: apply to [n_vectors * n_dims] (one RoPE per vector)
+int l26f_metal_rope_batch(
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src,
+    uint32_t                n_dims,
+    uint32_t                n_vectors,
+    int32_t                 position,
+    float                   theta);
+
+// MLA attention: MQA dot-product + softmax + weighted sum
+// q_absorbed: [H * kv_lora_rank], q_pe: [H * n_rot], kv_cache: [n_cached * kv_dim]
+// attn_out: [H * kv_lora_rank]
+int l26f_mla_attn(
+    ds4_metal_tensor       *attn_out,
+    const ds4_metal_tensor *q_absorbed,
+    const ds4_metal_tensor *q_pe,
+    const ds4_metal_tensor *kv_cache,
+    uint32_t                n_heads,
+    uint32_t                kv_lora_rank,
+    uint32_t                n_rot,
+    uint32_t                n_cached,
+    float                   scale);
+
+// Batched IQ4_NL matvec: for each of n_heads, do [out_rows, in_dim] IQ4_NL matvec
+// Input layout: [n_heads * in_dim]  (contiguous per head)
+// Output layout: [n_heads * out_rows]
+// Weights: model_map + weight_offset, with head_stride bytes between head slices
+int l26f_metal_batch_iq4_nl_matvec(
+    ds4_metal_tensor       *dst,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 out_rows,
+    uint32_t                 n_heads,
+    uint64_t                 head_stride,
+    const ds4_metal_tensor *input);
+
 #endif

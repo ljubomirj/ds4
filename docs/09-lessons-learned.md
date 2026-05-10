@@ -296,3 +296,20 @@ data format would have revealed.
 ```
 Stays in source permanently. Compiles to nothing in release. Follows the
 ALL_CAPS convention for non-business-logic code.
+
+## Lesson 6: Scavenge Existing Implementations (2026-05-10)
+
+**Observation**: When building GPU MLA kernels, the llama.cpp Ling branch at
+`worktrees/LJ-Ling-2.6-flash-r2/` already has a working implementation.
+It uses **no dedicated MLA kernels** — just composes standard `ggml_mul_mat`
+(with 3D broadcast r2/r3=1) and `ggml_flash_attn_ext` (MQA via ne02/ne_12_2 ratio).
+
+**Key files to scavenge**:
+- `ggml/src/ggml-metal/ggml-metal.metal` — RoPE, flash attention, IQ4_NL dequant
+- `ggml/src/ggml-metal/ggml-metal-impl.h` — args structs
+- `src/models/bailing-hybrid.cpp` — MLA graph flow (absorption, V-decompress)
+
+**Resources on disk** documented in `docs/16-resources-on-disk.md`:
+- 7 llama.cpp worktrees with Ling support
+- 20+ MLX/Metal repos at `~/LJ-asi-mlx/` for Metal kernel patterns
+- `contrib/ds4/` — the ds4 engine l26f is modeled after

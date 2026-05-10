@@ -97,11 +97,26 @@ l26f_tokenizer *l26f_tokenizer_from_model(const l26f_model *m) {
         t->tokens[i].len = (uint32_t)slen;
     }
 
-    XLOG("TOK: %u tokens read, hash map deferred (skip 5MB calloc)", t->n_tokens);
-    t->token_map_cap = 0;
-    t->token_map = NULL;
+    XLOG("TOK: %u tokens read, building hash map (cap=%u)...",
+            t->n_tokens, t->n_tokens * 2 + 1);
+    t->token_map_cap = t->n_tokens * 2 + 1;
+    t->token_map = (l26f_token_map_entry *)malloc(t->token_map_cap * sizeof(l26f_token_map_entry));
+    XLOG("TOK: malloc done, memset...");
+    memset(t->token_map, 0, t->token_map_cap * sizeof(l26f_token_map_entry));
+    XLOG("TOK: memset done, inserting %u entries...", t->n_tokens);
+    for (uint32_t i = 0; i < t->n_tokens; i++) {
+        if (i % 10000 == 0) XLOG("TOK: hash insert %u / %u", i, t->n_tokens);
+        uint32_t h = 5381;
+        for (uint32_t j = 0; j < t->tokens[i].len; j++)
+            h = ((h << 5) + h) + (uint32_t)(uint8_t)t->tokens[i].text[j];
+        uint32_t idx = h % t->token_map_cap;
+        while (t->token_map[idx].text != NULL)
+            idx = (idx + 1) % t->token_map_cap;
+        t->token_map[idx].text = t->tokens[i].text;
+        t->token_map[idx].id = (int32_t)i;
+    }
 
-    XLOG("TOK: hash map skipped");
+    XLOG("TOK: hash map built");
     if (m->tok_merges_count > 0) {
         XLOG("TOK: loading %llu merges...",
                 (unsigned long long)m->tok_merges_count);
@@ -185,7 +200,7 @@ static int32_t l26f_token_lookup(const l26f_tokenizer *t, const char *text, uint
     for (uint32_t j = 0; j < len; j++)
         h = ((h << 5) + h) + (uint32_t)(uint8_t)text[j];
     uint32_t idx = h % t->token_map_cap;
-    while (t->token_map[idx].id >= 0) {
+    while (t->token_map[idx].text != NULL) {
         if (strlen(t->token_map[idx].text) == len &&
             memcmp(t->token_map[idx].text, text, len) == 0) {
             return t->token_map[idx].id;

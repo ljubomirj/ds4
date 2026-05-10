@@ -44,6 +44,7 @@ docs/                        All design, status, and convention documents
 | `11-status-tasks-complete.md` | 2026-05-09 | All 32 layers working, multi-token gen |
 | `12-status-tokenizer-partial.md` | 2026-05-10 | Tokenizer integration partial |
 | `15-status-tokenizer-working.md` | 2026-05-10 | Tokenizer working, text gen live, hash map deferred |
+| `16-resources-on-disk.md` | 2026-05-10 | Full index of on-disk reference resources |
 
 ### Reference Documents
 
@@ -60,6 +61,12 @@ docs/                        All design, status, and convention documents
 | File | Purpose |
 |------|---------|
 | `xcommon.c`, `.h`, `.hpp` | Extract from itrade's xcommon.h (debug macros, safer allocs) |
+
+### Resource Map
+
+| File | Purpose |
+|------|---------|
+| `docs/16-resources-on-disk.md` | Full index of on-disk resources: worktrees, MLX repos, Metal references |
 
 ## Current State (2026-05-10)
 

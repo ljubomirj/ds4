@@ -9,12 +9,18 @@
 #include "ds4_metal.h"
 #include "l26f_tokenizer.h"
 
-// Forward declaration for MLA CPU implementation
-typedef struct l26f_mla_kv_cache l26f_mla_kv_cache;
-extern l26f_mla_kv_cache *l26f_mla_kv_cache_alloc(int max_seq, int kv_dim);
-extern void l26f_mla_kv_cache_free(l26f_mla_kv_cache *c);
-extern int l26f_mla_layer_cpu(l26f_model *m, uint32_t layer, int position,
-    l26f_mla_kv_cache *kv_cache, const float *hidden_cpu, float *hidden_out_cpu);
+// Forward declarations for MLA GPU implementation
+typedef struct l26f_mla_kv_cache_gpu l26f_mla_kv_cache_gpu;
+typedef struct l26f_mla_compute l26f_mla_compute;
+
+extern l26f_mla_kv_cache_gpu *l26f_mla_kv_cache_gpu_alloc(int max_seq, int kv_dim);
+extern void l26f_mla_kv_cache_gpu_free(l26f_mla_kv_cache_gpu *c);
+extern l26f_mla_compute *l26f_mla_compute_alloc(uint32_t n_embd, uint32_t n_head,
+    uint32_t q_lora_rank, uint32_t kv_lora_rank, uint32_t n_rot, uint32_t head_dim);
+extern void l26f_mla_compute_free(l26f_mla_compute *mc);
+extern int l26f_mla_layer_gpu(l26f_model *m, uint32_t layer, int position,
+    l26f_mla_kv_cache_gpu *kv_cache, l26f_mla_compute *mc,
+    ds4_metal_tensor *hidden_1xN, ds4_metal_tensor *out_1xN);
 
 // ---- Per-layer compute buffer set ----
 // Reused across layers to avoid excessive allocation.
@@ -46,7 +52,8 @@ typedef struct {
     l26f_model *model;
     l26f_compute comp;
     l26f_gla_state gla_states[32];
-    l26f_mla_kv_cache *mla_kv[32];
+    l26f_mla_kv_cache_gpu *mla_kv[32];
+    l26f_mla_compute *mla_comp;
     ds4_metal_tensor *hidden_1xN;
     ds4_metal_tensor *output_normed_1xN;
     ds4_metal_tensor *logits_1xV;
@@ -577,9 +584,14 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     const uint32_t kv_dim = m->kv_lora_rank + m->n_rot;  // 512 + 64 = 576
     for (uint32_t i = 0; i < 32; i++) {
         if (!m->is_mla[i]) continue;
-        s->mla_kv[i] = l26f_mla_kv_cache_alloc(4096, kv_dim);
+        s->mla_kv[i] = l26f_mla_kv_cache_gpu_alloc(4096, kv_dim);
         if (!s->mla_kv[i]) { fprintf(stderr, "l26f: OOM MLA KV cache %u\n", i); return 0; }
     }
+
+    // MLA GPU compute buffers (shared across all MLA layers)
+    s->mla_comp = l26f_mla_compute_alloc(n_embd, m->n_head, m->q_lora_rank,
+                                           m->kv_lora_rank, m->n_rot, 192);
+    if (!s->mla_comp) { fprintf(stderr, "l26f: OOM MLA compute buffers\n"); return 0; }
 
     if (!s->comp.normed_1xN || !s->comp.qkv_1x3N || !s->comp.gate_out_1xN ||
         !s->comp.gla_out_1xNxSxSxH || !s->comp.attn_proj_1xN || !s->comp.post_attn_1xN ||
@@ -614,8 +626,10 @@ static void l26f_session_free(l26f_session *s) {
         if (s->gla_states[i].state)
             ds4_metal_tensor_free(s->gla_states[i].state);
         if (s->mla_kv[i])
-            l26f_mla_kv_cache_free(s->mla_kv[i]);
+            l26f_mla_kv_cache_gpu_free(s->mla_kv[i]);
     }
+    if (s->mla_comp)
+        l26f_mla_compute_free(s->mla_comp);
 }
 
 static int l26f_dequant_q8_0_row(const uint8_t *base, uint64_t row_offset,
@@ -696,25 +710,24 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
     for (uint32_t il = 0; il < 32; il++) {
         if (model->is_mla[il]) {
             const uint64_t act_bytes = (uint64_t)model->n_embd * sizeof(float);
-            float *hidden_cpu_1xN = (float *)malloc(act_bytes);
-            float *hidden_out_1xN = (float *)malloc(act_bytes);
-            ds4_metal_tensor_read(session->hidden_1xN, 0, hidden_cpu_1xN, act_bytes);
-            if (!l26f_mla_layer_cpu(model, il, position, session->mla_kv[il],
-                                     hidden_cpu_1xN, hidden_out_1xN)) {
-                fprintf(stderr, "MLA layer %u failed\n", il);
-                free(hidden_cpu_1xN); free(hidden_out_1xN);
+            ds4_metal_tensor *out_1xN = session->comp.post_attn_1xN;
+            if (!l26f_mla_layer_gpu(model, il, position, session->mla_kv[il],
+                                     session->mla_comp, session->hidden_1xN, out_1xN)) {
+                fprintf(stderr, "MLA GPU layer %u failed\n", il);
                 return 0;
             }
-            ds4_metal_tensor *out_1xN = session->comp.post_attn_1xN;
-            ds4_metal_tensor_write(out_1xN, 0, hidden_out_1xN, act_bytes);
-            ds4_metal_tensor_write(session->hidden_1xN, 0, hidden_out_1xN, act_bytes);
-            free(hidden_cpu_1xN); free(hidden_out_1xN);
+
+            // Copy out to hidden for MoE FFN input
+            float *tmp = (float *)malloc(act_bytes);
+            ds4_metal_tensor_read(out_1xN, 0, tmp, act_bytes);
+            ds4_metal_tensor_write(session->hidden_1xN, 0, tmp, act_bytes);
+            free(tmp);
 
             if (!l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN)) {
                 fprintf(stderr, "MoE FFN layer %u failed\n", il);
                 return 0;
             }
-            if (verbose) printf("  layer %u: MLA + MoE\n", il);
+            if (verbose) printf("  layer %u: MLA GPU + MoE\n", il);
             continue;
         }
 
