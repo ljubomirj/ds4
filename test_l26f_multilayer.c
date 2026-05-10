@@ -90,9 +90,6 @@ static int l26f_gla_layer(
     const uint32_t n_embd = m->n_embd;
     const uint32_t S = 128, H = m->n_head;
     const uint64_t act_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t qkv_bytes = 3ULL * n_embd * sizeof(float);
-    const uint64_t gla_state_bytes = (uint64_t)S * S * H * sizeof(float);
-    const uint64_t gla_out_bytes = act_bytes + gla_state_bytes;
     float scale = 1.0f / sqrtf((float)S);
 
     l26f_tensor *wt_norm_N      = l26f_layer_tensor(m, layer, "attn_norm.weight");
@@ -228,9 +225,7 @@ static int l26f_moe_ffn(
     const uint32_t n_embd = m->n_embd;
     const uint32_t n_ff_exp = 1024;  // expert hidden dim
     const uint32_t n_expert = 256;
-    const uint32_t n_expert_used = 8;
     const uint32_t n_groups = 8;
-    const uint32_t n_group_used = 4;
     const uint32_t n_exp_per_group = n_expert / n_groups;  // 32
     const float w_scale = 2.5f;
 
