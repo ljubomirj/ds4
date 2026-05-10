@@ -22,19 +22,19 @@ extern int l26f_mla_layer_cpu(l26f_model *m, uint32_t layer, int position,
 // All are n_embd-sized except qkv (3*n_embd) and gla_out (n_embd + S*S*H).
 
 typedef struct {
-    ds4_metal_tensor *normed;
-    ds4_metal_tensor *qkv;
-    ds4_metal_tensor *gate_out;
-    ds4_metal_tensor *gla_out;
-    ds4_metal_tensor *attn_proj;
-    ds4_metal_tensor *post_attn;
-    ds4_metal_tensor *ffn_normed;
-    ds4_metal_tensor *ffn_gate;
-    ds4_metal_tensor *ffn_up;
-    ds4_metal_tensor *ffn_mid;
-    ds4_metal_tensor *ffn_down;
-    ds4_metal_tensor *moe_out;      // accumulated MoE output
-    ds4_metal_tensor *shexp_out;    // shared expert output
+    ds4_metal_tensor *normed_1xN;
+    ds4_metal_tensor *qkv_1x3N;
+    ds4_metal_tensor *gate_out_1xN;
+    ds4_metal_tensor *gla_out_1xNxSxSxH;
+    ds4_metal_tensor *attn_proj_1xN;
+    ds4_metal_tensor *post_attn_1xN;
+    ds4_metal_tensor *ffn_normed_1xN;
+    ds4_metal_tensor *ffn_gate_1xF;
+    ds4_metal_tensor *ffn_up_1xF;
+    ds4_metal_tensor *ffn_mid_1xF;
+    ds4_metal_tensor *ffn_down_1xN;
+    ds4_metal_tensor *moe_out_1xN;
+    ds4_metal_tensor *shexp_out_1xN;
 } l26f_compute;
 
 // GLA state: one per GLA layer, persists across tokens
@@ -46,10 +46,10 @@ typedef struct {
     l26f_model *model;
     l26f_compute comp;
     l26f_gla_state gla_states[32];
-    l26f_mla_kv_cache *mla_kv[32];  // MLA KV caches (only layers 7,15,23,31)
-    ds4_metal_tensor *hidden;
-    ds4_metal_tensor *output_normed;
-    ds4_metal_tensor *logits;
+    l26f_mla_kv_cache *mla_kv[32];
+    ds4_metal_tensor *hidden_1xN;
+    ds4_metal_tensor *output_normed_1xN;
+    ds4_metal_tensor *logits_1xV;
 } l26f_session;
 
 // ---- helpers ----
@@ -95,56 +95,53 @@ static int l26f_gla_layer(
     const uint64_t gla_out_bytes = act_bytes + gla_state_bytes;
     float scale = 1.0f / sqrtf((float)S);
 
-    l26f_tensor *wt_norm = l26f_layer_tensor(m, layer, "attn_norm.weight");
-    l26f_tensor *wt_qkv  = l26f_layer_tensor(m, layer, "attn_qkv.weight");
-    l26f_tensor *wt_gate = l26f_layer_tensor(m, layer, "attn_gate.weight");
-    l26f_tensor *wt_out  = l26f_layer_tensor(m, layer, "attn_output.weight");
-    if (!wt_norm || !wt_qkv || !wt_gate || !wt_out) {
+    l26f_tensor *wt_norm_N      = l26f_layer_tensor(m, layer, "attn_norm.weight");
+    l26f_tensor *wt_qkv_Nx3N    = l26f_layer_tensor(m, layer, "attn_qkv.weight");
+    l26f_tensor *wt_gate_NxN    = l26f_layer_tensor(m, layer, "attn_gate.weight");
+    l26f_tensor *wt_out_NxN     = l26f_layer_tensor(m, layer, "attn_output.weight");
+    if (!wt_norm_N || !wt_qkv_Nx3N || !wt_gate_NxN || !wt_out_NxN) {
         fprintf(stderr, "l26f: layer %u missing GLA tensors\n", layer);
         return 0;
     }
 
     // 1. RMS norm
-    if (!ds4_metal_rms_norm_weight_tensor(c->normed, inp,
-            m->map, m->size, wt_norm->abs_offset, n_embd, m->rms_norm_eps))
+    if (!ds4_metal_rms_norm_weight_tensor(c->normed_1xN, inp,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
         return 0;
 
-    // 2. QKV matvec
-    if (!l26f_metal_matvec_quant(c->qkv, c->normed,
-            m->map, m->size, wt_qkv->abs_offset,
-            wt_qkv->dim[0], wt_qkv->dim[1], wt_qkv->type, 1))
+    if (!l26f_metal_matvec_quant(c->qkv_1x3N, c->normed_1xN,
+            m->map, m->size, wt_qkv_Nx3N->abs_offset,
+            wt_qkv_Nx3N->dim[0], wt_qkv_Nx3N->dim[1], wt_qkv_Nx3N->type, 1))
         return 0;
 
-    // 3. Gate matvec
-    if (!l26f_metal_matvec_quant(c->gate_out, c->normed,
-            m->map, m->size, wt_gate->abs_offset,
-            wt_gate->dim[0], wt_gate->dim[1], wt_gate->type, 1))
+    if (!l26f_metal_matvec_quant(c->gate_out_1xN, c->normed_1xN,
+            m->map, m->size, wt_gate_NxN->abs_offset,
+            wt_gate_NxN->dim[0], wt_gate_NxN->dim[1], wt_gate_NxN->type, 1))
         return 0;
 
-    // 4. GLA attention
-    ds4_metal_tensor *q_view = ds4_metal_tensor_view(c->qkv, 0, act_bytes);
-    ds4_metal_tensor *k_view = ds4_metal_tensor_view(c->qkv, act_bytes, act_bytes);
-    ds4_metal_tensor *v_view = ds4_metal_tensor_view(c->qkv, 2*act_bytes, act_bytes);
+    ds4_metal_tensor *q_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, 0, act_bytes);
+    ds4_metal_tensor *k_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, act_bytes, act_bytes);
+    ds4_metal_tensor *v_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, 2*act_bytes, act_bytes);
 
-    int ok = l26f_metal_gla(c->gla_out, s->gla_states[layer].state,
-                q_view, k_view, v_view, c->gate_out,
+    int ok = l26f_metal_gla(c->gla_out_1xNxSxSxH, s->gla_states[layer].state,
+                q_view_1xN, k_view_1xN, v_view_1xN, c->gate_out_1xN,
                 1, 1, S, H, scale);
 
-    ds4_metal_tensor_free(v_view);
-    ds4_metal_tensor_free(k_view);
-    ds4_metal_tensor_free(q_view);
+    ds4_metal_tensor_free(v_view_1xN);
+    ds4_metal_tensor_free(k_view_1xN);
+    ds4_metal_tensor_free(q_view_1xN);
     if (!ok) return 0;
 
     // 5. Output projection (first n_embd floats of gla_out are the attention output)
-    ds4_metal_tensor *gla_act = ds4_metal_tensor_view(c->gla_out, 0, act_bytes);
-    ok = l26f_metal_matvec_quant(c->attn_proj, gla_act,
-            m->map, m->size, wt_out->abs_offset,
-            wt_out->dim[0], wt_out->dim[1], wt_out->type, 1);
-    ds4_metal_tensor_free(gla_act);
+    ds4_metal_tensor *gla_act_1xN = ds4_metal_tensor_view(c->gla_out_1xNxSxSxH, 0, act_bytes);
+    ok = l26f_metal_matvec_quant(c->attn_proj_1xN, gla_act_1xN,
+            m->map, m->size, wt_out_NxN->abs_offset,
+            wt_out_NxN->dim[0], wt_out_NxN->dim[1], wt_out_NxN->type, 1);
+    ds4_metal_tensor_free(gla_act_1xN);
     if (!ok) return 0;
 
     // 6. Residual add: out = inp + attn_proj
-    if (!ds4_metal_add_tensor(out, inp, c->attn_proj, n_embd))
+    if (!ds4_metal_add_tensor(out, inp, c->attn_proj_1xN, n_embd))
         return 0;
 
     return 1;
@@ -158,44 +155,39 @@ static int l26f_dense_ffn(
     const uint32_t n_embd = m->n_embd;
     const uint32_t n_ff = m->n_ff;
 
-    l26f_tensor *wt_norm = l26f_layer_tensor(m, 0, "ffn_norm.weight");
-    l26f_tensor *wt_gate = l26f_layer_tensor(m, 0, "ffn_gate.weight");
-    l26f_tensor *wt_up   = l26f_layer_tensor(m, 0, "ffn_up.weight");
-    l26f_tensor *wt_down = l26f_layer_tensor(m, 0, "ffn_down.weight");
-    if (!wt_norm || !wt_gate || !wt_up || !wt_down) {
+    l26f_tensor *wt_norm_N     = l26f_layer_tensor(m, 0, "ffn_norm.weight");
+    l26f_tensor *wt_gate_NxF   = l26f_layer_tensor(m, 0, "ffn_gate.weight");
+    l26f_tensor *wt_up_NxF     = l26f_layer_tensor(m, 0, "ffn_up.weight");
+    l26f_tensor *wt_down_FxN   = l26f_layer_tensor(m, 0, "ffn_down.weight");
+    if (!wt_norm_N || !wt_gate_NxF || !wt_up_NxF || !wt_down_FxN) {
         fprintf(stderr, "l26f: layer 0 missing dense FFN tensors\n");
         return 0;
     }
 
     // 1. RMS norm
-    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed, inp,
-            m->map, m->size, wt_norm->abs_offset, n_embd, m->rms_norm_eps))
+    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed_1xN, inp,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
         return 0;
 
-    // 2. Gate projection
-    if (!l26f_metal_matvec_quant(c->ffn_gate, c->ffn_normed,
-            m->map, m->size, wt_gate->abs_offset,
-            wt_gate->dim[0], wt_gate->dim[1], wt_gate->type, 1))
+    if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_gate_NxF->abs_offset,
+            wt_gate_NxF->dim[0], wt_gate_NxF->dim[1], wt_gate_NxF->type, 1))
         return 0;
 
-    // 3. Up projection
-    if (!l26f_metal_matvec_quant(c->ffn_up, c->ffn_normed,
-            m->map, m->size, wt_up->abs_offset,
-            wt_up->dim[0], wt_up->dim[1], wt_up->type, 1))
+    if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_up_NxF->abs_offset,
+            wt_up_NxF->dim[0], wt_up_NxF->dim[1], wt_up_NxF->type, 1))
         return 0;
 
-    // 4. SwiGLU: silu(gate) * up
-    if (!ds4_metal_swiglu_tensor(c->ffn_mid, c->ffn_gate, c->ffn_up, n_ff, 0.0f, 1.0f))
+    if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff, 0.0f, 1.0f))
         return 0;
 
-    // 5. Down projection
-    if (!l26f_metal_matvec_quant(c->ffn_down, c->ffn_mid,
-            m->map, m->size, wt_down->abs_offset,
-            wt_down->dim[0], wt_down->dim[1], wt_down->type, 1))
+    if (!l26f_metal_matvec_quant(c->ffn_down_1xN, c->ffn_mid_1xF,
+            m->map, m->size, wt_down_FxN->abs_offset,
+            wt_down_FxN->dim[0], wt_down_FxN->dim[1], wt_down_FxN->type, 1))
         return 0;
 
-    // 6. Residual add: out = inp + ffn_down
-    if (!ds4_metal_add_tensor(out, inp, c->ffn_down, n_embd))
+    if (!ds4_metal_add_tensor(out, inp, c->ffn_down_1xN, n_embd))
         return 0;
 
     return 1;
@@ -243,204 +235,188 @@ static int l26f_moe_ffn(
     const float w_scale = 2.5f;
 
     // Find tensors
-    l26f_tensor *wt_norm      = l26f_layer_tensor(m, layer, "ffn_norm.weight");
-    l26f_tensor *wt_gate_inp  = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
-    l26f_tensor *wt_exp_b     = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
-    l26f_tensor *wt_gate_exps = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
-    l26f_tensor *wt_up_exps   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
-    l26f_tensor *wt_down_exps = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
-    l26f_tensor *wt_gate_sh   = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
-    l26f_tensor *wt_up_sh     = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
-    l26f_tensor *wt_down_sh   = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
-    if (!wt_norm || !wt_gate_inp || !wt_gate_exps || !wt_up_exps || !wt_down_exps ||
-        !wt_gate_sh || !wt_up_sh || !wt_down_sh) {
+    l26f_tensor *wt_norm_N          = l26f_layer_tensor(m, layer, "ffn_norm.weight");
+    l26f_tensor *wt_gate_inp_NxE    = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
+    l26f_tensor *wt_exp_b_1xE       = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
+    l26f_tensor *wt_gate_exps_NxMxE = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
+    l26f_tensor *wt_up_exps_NxMxE   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
+    l26f_tensor *wt_down_exps_MxNxE = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
+    l26f_tensor *wt_gate_sh_NxM     = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
+    l26f_tensor *wt_up_sh_NxM       = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
+    l26f_tensor *wt_down_sh_MxN     = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
+    if (!wt_norm_N || !wt_gate_inp_NxE || !wt_gate_exps_NxMxE || !wt_up_exps_NxMxE || !wt_down_exps_MxNxE ||
+        !wt_gate_sh_NxM || !wt_up_sh_NxM || !wt_down_sh_MxN) {
         fprintf(stderr, "l26f: layer %u missing MoE tensors\n", layer);
         return 0;
     }
 
     // 1. RMS norm
-    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed, inp,
-            m->map, m->size, wt_norm->abs_offset, n_embd, m->rms_norm_eps))
+    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed_1xN, inp,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
         return 0;
 
-    // 2. CPU-side router: read hidden, compute logits
-    float *hidden_cpu = (float *)malloc(n_embd * sizeof(float));
-    ds4_metal_tensor_read(c->ffn_normed, 0, hidden_cpu, n_embd * sizeof(float));
+    float *hidden_cpu_1xN = (float *)malloc(n_embd * sizeof(float));
+    ds4_metal_tensor_read(c->ffn_normed_1xN, 0, hidden_cpu_1xN, n_embd * sizeof(float));
 
-    float logits[256];
-    float *gate_inp_data = (float *)(m->map + wt_gate_inp->abs_offset);
-    // ffn_gate_inp shape: [4096, 256] — row-major, so element [i, e] is at i*256 + e
+    float router_logits_1xE[256];
+    float *gate_inp_data_NxE = (float *)(m->map + wt_gate_inp_NxE->abs_offset);
     for (uint32_t e = 0; e < n_expert; e++) {
         float sum = 0;
         for (uint32_t i = 0; i < n_embd; i++) {
-            sum += hidden_cpu[i] * gate_inp_data[i * n_expert + e];
+            sum += hidden_cpu_1xN[i] * gate_inp_data_NxE[i * n_expert + e];
         }
-        logits[e] = sum;
+        router_logits_1xE[e] = sum;
     }
 
-    // Add exp_probs_b bias if present
-    if (wt_exp_b) {
-        float *bias = (float *)(m->map + wt_exp_b->abs_offset);
-        for (uint32_t e = 0; e < n_expert; e++) logits[e] += bias[e];
+    if (wt_exp_b_1xE) {
+        float *bias_1xE = (float *)(m->map + wt_exp_b_1xE->abs_offset);
+        for (uint32_t e = 0; e < n_expert; e++) router_logits_1xE[e] += bias_1xE[e];
     }
 
-    // 3. Softmax
-    float probs[256];
-    memcpy(probs, logits, sizeof(logits));
-    cpu_softmax(probs, n_expert);
+    float probs_1xE[256];
+    memcpy(probs_1xE, router_logits_1xE, sizeof(router_logits_1xE));
+    cpu_softmax(probs_1xE, n_expert);
 
-    // 4. Group scoring: sum of top-2 per group
-    float group_scores[8];
+    float group_scores_1xG[8];
     for (uint32_t g = 0; g < n_groups; g++) {
         float top2[2] = {0, 0};
         for (uint32_t i = 0; i < n_exp_per_group; i++) {
-            float p = probs[g * n_exp_per_group + i];
+            float p = probs_1xE[g * n_exp_per_group + i];
             if (p > top2[0]) { top2[1] = top2[0]; top2[0] = p; }
             else if (p > top2[1]) { top2[1] = p; }
         }
-        group_scores[g] = top2[0] + top2[1];
+        group_scores_1xG[g] = top2[0] + top2[1];
     }
 
-    // 5. Select top-4 groups
-    int selected_groups[8];
-    for (int i = 0; i < 8; i++) selected_groups[i] = i;
-    // Simple selection sort for top-4
+    int selected_groups_1xG[8];
+    for (int i = 0; i < 8; i++) selected_groups_1xG[i] = i;
     for (int i = 0; i < 4; i++) {
         int best = i;
         for (int j = i+1; j < 8; j++) {
-            if (group_scores[selected_groups[j]] > group_scores[selected_groups[best]])
+            if (group_scores_1xG[selected_groups_1xG[j]] > group_scores_1xG[selected_groups_1xG[best]])
                 best = j;
         }
-        int tmp = selected_groups[i]; selected_groups[i] = selected_groups[best]; selected_groups[best] = tmp;
+        int tmp = selected_groups_1xG[i]; selected_groups_1xG[i] = selected_groups_1xG[best]; selected_groups_1xG[best] = tmp;
     }
 
-    // 6. Mask: build masked probs (only selected groups)
-    float masked_probs[256];
-    memcpy(masked_probs, probs, sizeof(probs));
+    float masked_probs_1xE[256];
+    memcpy(masked_probs_1xE, probs_1xE, sizeof(probs_1xE));
     for (uint32_t g = 0; g < n_groups; g++) {
         bool selected = false;
-        for (int i = 0; i < 4; i++) if (selected_groups[i] == (int)g) selected = true;
+        for (int i = 0; i < 4; i++) if (selected_groups_1xG[i] == (int)g) selected = true;
         if (!selected) {
             for (uint32_t i = 0; i < n_exp_per_group; i++)
-                masked_probs[g * n_exp_per_group + i] = -INFINITY;
+                masked_probs_1xE[g * n_exp_per_group + i] = -INFINITY;
         }
     }
 
-    // 7. Top-8 from masked pool
-    int selected_experts[8];
-    float selected_weights[8];
+    int selected_experts_K[8];
+    float selected_weights_K[8];
     for (int i = 0; i < 8; i++) {
         int best_e = 0;
         float best_p = -INFINITY;
         for (uint32_t e = 0; e < n_expert; e++) {
-            if (masked_probs[e] > best_p) { best_p = masked_probs[e]; best_e = (int)e; }
+            if (masked_probs_1xE[e] > best_p) { best_p = masked_probs_1xE[e]; best_e = (int)e; }
         }
-        selected_experts[i] = best_e;
-        selected_weights[i] = probs[best_e];  // use original probs for weights
-        masked_probs[best_e] = -INFINITY;  // remove from pool
+        selected_experts_K[i] = best_e;
+        selected_weights_K[i] = probs_1xE[best_e];
+        masked_probs_1xE[best_e] = -INFINITY;
     }
 
-    // 8. Normalize and scale weights
     float wsum = 0;
-    for (int i = 0; i < 8; i++) wsum += selected_weights[i];
+    for (int i = 0; i < 8; i++) wsum += selected_weights_K[i];
     if (wsum > 1e-6f) {
-        for (int i = 0; i < 8; i++) selected_weights[i] /= wsum;
+        for (int i = 0; i < 8; i++) selected_weights_K[i] /= wsum;
     }
-    for (int i = 0; i < 8; i++) selected_weights[i] *= w_scale;
+    for (int i = 0; i < 8; i++) selected_weights_K[i] *= w_scale;
 
-    free(hidden_cpu);
+    free(hidden_cpu_1xN);
 
     if (layer == 4) {
         printf("    MoE layer %u: experts=[", layer);
-        for (int i = 0; i < 8; i++) printf("%d ", selected_experts[i]);
+        for (int i = 0; i < 8; i++) printf("%d ", selected_experts_K[i]);
         printf("] weights=[");
-        for (int i = 0; i < 8; i++) printf("%.4f ", selected_weights[i]);
+        for (int i = 0; i < 8; i++) printf("%.4f ", selected_weights_K[i]);
         printf("]\n");
     }
 
     // 9. Run selected experts on GPU
     // Zero the accumulator
     float zero = 0.0f;
-    ds4_metal_tensor_write(c->moe_out, 0, &zero, sizeof(float));
+    ds4_metal_tensor_write(c->moe_out_1xN, 0, &zero, sizeof(float));
     // Actually need to zero the whole buffer. Use a temp zero buffer.
     {
         void *z = calloc(1, n_embd * sizeof(float));
-        ds4_metal_tensor_write(c->moe_out, 0, z, n_embd * sizeof(float));
+        ds4_metal_tensor_write(c->moe_out_1xN, 0, z, n_embd * sizeof(float));
         free(z);
     }
 
     if (layer == 1) {
         printf("    down_exps: ndim=%u dims=[%lu,%lu,%lu] type=%u abs_off=%lu\n",
-               wt_down_exps->ndim,
-               (unsigned long)wt_down_exps->dim[0], (unsigned long)wt_down_exps->dim[1],
-               (unsigned long)wt_down_exps->dim[2],
-               wt_down_exps->type, (unsigned long)wt_down_exps->abs_offset);
+               wt_down_exps_MxNxE->ndim,
+               (unsigned long)wt_down_exps_MxNxE->dim[0], (unsigned long)wt_down_exps_MxNxE->dim[1],
+               (unsigned long)wt_down_exps_MxNxE->dim[2],
+               wt_down_exps_MxNxE->type, (unsigned long)wt_down_exps_MxNxE->abs_offset);
         printf("    gate_exps: ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
-               wt_gate_exps->ndim,
-               (unsigned long)wt_gate_exps->dim[0], (unsigned long)wt_gate_exps->dim[1],
-               (unsigned long)wt_gate_exps->dim[2],
-               wt_gate_exps->type);
+               wt_gate_exps_NxMxE->ndim,
+               (unsigned long)wt_gate_exps_NxMxE->dim[0], (unsigned long)wt_gate_exps_NxMxE->dim[1],
+               (unsigned long)wt_gate_exps_NxMxE->dim[2],
+               wt_gate_exps_NxMxE->type);
         printf("    up_exps:   ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
-               wt_up_exps->ndim,
-               (unsigned long)wt_up_exps->dim[0], (unsigned long)wt_up_exps->dim[1],
-               (unsigned long)wt_up_exps->dim[2],
-               wt_up_exps->type);
+               wt_up_exps_NxMxE->ndim,
+               (unsigned long)wt_up_exps_NxMxE->dim[0], (unsigned long)wt_up_exps_NxMxE->dim[1],
+               (unsigned long)wt_up_exps_NxMxE->dim[2],
+               wt_up_exps_NxMxE->type);
         printf("    gate_sh:   ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
-               wt_gate_sh->ndim,
-               (unsigned long)wt_gate_sh->dim[0], (unsigned long)wt_gate_sh->dim[1],
-               (unsigned long)wt_gate_sh->dim[2],
-               wt_gate_sh->type);
+               wt_gate_sh_NxM->ndim,
+               (unsigned long)wt_gate_sh_NxM->dim[0], (unsigned long)wt_gate_sh_NxM->dim[1],
+               (unsigned long)wt_gate_sh_NxM->dim[2],
+               wt_gate_sh_NxM->type);
         printf("    down_sh:   ndim=%u dims=[%lu,%lu,%lu] type=%u\n",
-               wt_down_sh->ndim,
-               (unsigned long)wt_down_sh->dim[0], (unsigned long)wt_down_sh->dim[1],
-               (unsigned long)wt_down_sh->dim[2],
-               wt_down_sh->type);
+               wt_down_sh_MxN->ndim,
+               (unsigned long)wt_down_sh_MxN->dim[0], (unsigned long)wt_down_sh_MxN->dim[1],
+               (unsigned long)wt_down_sh_MxN->dim[2],
+               wt_down_sh_MxN->type);
     }
 
-    // Expert bytes per tensor — use actual type block_size/type_size
-    const uint32_t gate_bs = l26f_types[wt_gate_exps->type].block_size;
-    const uint32_t gate_ts = l26f_types[wt_gate_exps->type].type_size;
-    const uint32_t up_bs   = l26f_types[wt_up_exps->type].block_size;
-    const uint32_t up_ts   = l26f_types[wt_up_exps->type].type_size;
-    const uint32_t down_bs = l26f_types[wt_down_exps->type].block_size;
-    const uint32_t down_ts = l26f_types[wt_down_exps->type].type_size;
-    // per-expert rows = dim[1], cols = dim[0], stride = dim[1] * (dim[0]/bs) * ts
-    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps->dim[1] * (wt_gate_exps->dim[0] / gate_bs) * gate_ts;
-    const uint64_t up_exp_bytes   = (uint64_t)wt_up_exps->dim[1]   * (wt_up_exps->dim[0]   / up_bs)   * up_ts;
-    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps->dim[1] * (wt_down_exps->dim[0] / down_bs) * down_ts;
+    const uint32_t gate_bs = l26f_types[wt_gate_exps_NxMxE->type].block_size;
+    const uint32_t gate_ts = l26f_types[wt_gate_exps_NxMxE->type].type_size;
+    const uint32_t up_bs   = l26f_types[wt_up_exps_NxMxE->type].block_size;
+    const uint32_t up_ts   = l26f_types[wt_up_exps_NxMxE->type].type_size;
+    const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
+    const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps_NxMxE->dim[1] * (wt_gate_exps_NxMxE->dim[0] / gate_bs) * gate_ts;
+    const uint64_t up_exp_bytes   = (uint64_t)wt_up_exps_NxMxE->dim[1]   * (wt_up_exps_NxMxE->dim[0]   / up_bs)   * up_ts;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * (wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
 
     for (int i = 0; i < 8; i++) {
-        int e = selected_experts[i];
-        uint64_t gate_off = wt_gate_exps->abs_offset + (uint64_t)e * gate_exp_bytes;
-        uint64_t up_off   = wt_up_exps->abs_offset   + (uint64_t)e * up_exp_bytes;
-        uint64_t down_off = wt_down_exps->abs_offset + (uint64_t)e * down_exp_bytes;
+        int e = selected_experts_K[i];
+        uint64_t gate_off = wt_gate_exps_NxMxE->abs_offset + (uint64_t)e * gate_exp_bytes;
+        uint64_t up_off   = wt_up_exps_NxMxE->abs_offset   + (uint64_t)e * up_exp_bytes;
+        uint64_t down_off = wt_down_exps_MxNxE->abs_offset + (uint64_t)e * down_exp_bytes;
 
-        // Expert gate matvec: [n_embd → n_ff_exp]
-        if (!l26f_metal_matvec_quant(c->ffn_gate, c->ffn_normed,
+        if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
                 m->map, m->size, gate_off,
-                n_embd, n_ff_exp, wt_gate_exps->type, 1))
+                n_embd, n_ff_exp, wt_gate_exps_NxMxE->type, 1))
             return 0;
 
-        // Expert up matvec: [n_embd → n_ff_exp]
-        if (!l26f_metal_matvec_quant(c->ffn_up, c->ffn_normed,
+        if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
                 m->map, m->size, up_off,
-                n_embd, n_ff_exp, wt_up_exps->type, 1))
+                n_embd, n_ff_exp, wt_up_exps_NxMxE->type, 1))
             return 0;
 
-        // SwiGLU
-        if (!ds4_metal_swiglu_tensor(c->ffn_mid, c->ffn_gate, c->ffn_up, n_ff_exp, 0.0f, 1.0f))
+        if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff_exp, 0.0f, 1.0f))
             return 0;
 
-        // Expert down matvec: [n_ff_exp → n_embd]
-        if (!l26f_metal_matvec_quant(c->ffn_down, c->ffn_mid,
+        if (!l26f_metal_matvec_quant(c->ffn_down_1xN, c->ffn_mid_1xF,
                 m->map, m->size, down_off,
-                n_ff_exp, n_embd, wt_down_exps->type, 1))
+                n_ff_exp, n_embd, wt_down_exps_MxNxE->type, 1))
             return 0;
 
         // Debug: check expert output for NaN
         if (layer == 1 || layer == 4) {
             float *exp_out = (float *)malloc(n_embd * sizeof(float));
-            ds4_metal_tensor_read(c->ffn_down, 0, exp_out, n_embd * sizeof(float));
+            ds4_metal_tensor_read(c->ffn_down_1xN, 0, exp_out, n_embd * sizeof(float));
             float sum = 0; int nans = 0;
             for (uint32_t j = 0; j < n_embd; j++) {
                 if (isnan(exp_out[j])) nans++;
@@ -453,15 +429,15 @@ static int l26f_moe_ffn(
         }
         if (layer == 1) {
             float *tmp = (float *)malloc(n_ff_exp * sizeof(float));
-            ds4_metal_tensor_read(c->ffn_gate, 0, tmp, n_ff_exp * sizeof(float));
+            ds4_metal_tensor_read(c->ffn_gate_1xF, 0, tmp, n_ff_exp * sizeof(float));
             float sum = 0; int nans = 0;
             for (uint32_t j = 0; j < n_ff_exp; j++) { if (isnan(tmp[j])) nans++; else sum += tmp[j]; }
             if (nans > 0) printf("    EXPERT %d gate: nans=%d sum=%.3f\n", i, nans, sum);
-            ds4_metal_tensor_read(c->ffn_up, 0, tmp, n_ff_exp * sizeof(float));
+            ds4_metal_tensor_read(c->ffn_up_1xF, 0, tmp, n_ff_exp * sizeof(float));
             sum = 0; nans = 0;
             for (uint32_t j = 0; j < n_ff_exp; j++) { if (isnan(tmp[j])) nans++; else sum += tmp[j]; }
             if (nans > 0) printf("    EXPERT %d up: nans=%d sum=%.3f\n", i, nans, sum);
-            ds4_metal_tensor_read(c->ffn_mid, 0, tmp, n_ff_exp * sizeof(float));
+            ds4_metal_tensor_read(c->ffn_mid_1xF, 0, tmp, n_ff_exp * sizeof(float));
             sum = 0; nans = 0;
             for (uint32_t j = 0; j < n_ff_exp; j++) { if (isnan(tmp[j])) nans++; else sum += tmp[j]; }
             if (nans > 0) printf("    EXPERT %d mid: nans=%d sum=%.3f\n", i, nans, sum);
@@ -471,40 +447,40 @@ static int l26f_moe_ffn(
         // Accumulate weighted output: moe_out += weight * ffn_down
         // ds4 doesn't have a weighted-add kernel. Do on CPU for now.
         float *exp_out = (float *)malloc(n_embd * sizeof(float));
-        ds4_metal_tensor_read(c->ffn_down, 0, exp_out, n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->ffn_down_1xN, 0, exp_out, n_embd * sizeof(float));
         float *acc = (float *)malloc(n_embd * sizeof(float));
-        ds4_metal_tensor_read(c->moe_out, 0, acc, n_embd * sizeof(float));
-        float w = selected_weights[i];
+        ds4_metal_tensor_read(c->moe_out_1xN, 0, acc, n_embd * sizeof(float));
+        float w = selected_weights_K[i];
         for (uint32_t j = 0; j < n_embd; j++) acc[j] += w * exp_out[j];
-        ds4_metal_tensor_write(c->moe_out, 0, acc, n_embd * sizeof(float));
+        ds4_metal_tensor_write(c->moe_out_1xN, 0, acc, n_embd * sizeof(float));
         free(exp_out);
         free(acc);
     }
 
     // 10. Shared expert (always runs)
-    if (!l26f_metal_matvec_quant(c->ffn_gate, c->ffn_normed,
-            m->map, m->size, wt_gate_sh->abs_offset,
-            wt_gate_sh->dim[0], wt_gate_sh->dim[1], wt_gate_sh->type, 1))
+    if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_gate_sh_NxM->abs_offset,
+            wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1], wt_gate_sh_NxM->type, 1))
         return 0;
-    if (!l26f_metal_matvec_quant(c->ffn_up, c->ffn_normed,
-            m->map, m->size, wt_up_sh->abs_offset,
-            wt_up_sh->dim[0], wt_up_sh->dim[1], wt_up_sh->type, 1))
+    if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_up_sh_NxM->abs_offset,
+            wt_up_sh_NxM->dim[0], wt_up_sh_NxM->dim[1], wt_up_sh_NxM->type, 1))
         return 0;
-    if (!ds4_metal_swiglu_tensor(c->ffn_mid, c->ffn_gate, c->ffn_up, n_ff_exp, 0.0f, 1.0f))
+    if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff_exp, 0.0f, 1.0f))
         return 0;
-    if (!l26f_metal_matvec_quant(c->shexp_out, c->ffn_mid,
-            m->map, m->size, wt_down_sh->abs_offset,
-            wt_down_sh->dim[0], wt_down_sh->dim[1], wt_down_sh->type, 1))
+    if (!l26f_metal_matvec_quant(c->shexp_out_1xN, c->ffn_mid_1xF,
+            m->map, m->size, wt_down_sh_MxN->abs_offset,
+            wt_down_sh_MxN->dim[0], wt_down_sh_MxN->dim[1], wt_down_sh_MxN->type, 1))
         return 0;
 
     // Add shared expert to MoE output
     {
         float *moe = (float *)malloc(n_embd * sizeof(float));
         float *sh = (float *)malloc(n_embd * sizeof(float));
-        ds4_metal_tensor_read(c->moe_out, 0, moe, n_embd * sizeof(float));
-        ds4_metal_tensor_read(c->shexp_out, 0, sh, n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->moe_out_1xN, 0, moe, n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->shexp_out_1xN, 0, sh, n_embd * sizeof(float));
         for (uint32_t j = 0; j < n_embd; j++) moe[j] += sh[j];
-        ds4_metal_tensor_write(c->moe_out, 0, moe, n_embd * sizeof(float));
+        ds4_metal_tensor_write(c->moe_out_1xN, 0, moe, n_embd * sizeof(float));
         free(moe);
         free(sh);
     }
@@ -512,7 +488,7 @@ static int l26f_moe_ffn(
     // Debug: print moe_out magnitude before residual
     if (layer == 1 || layer == 4) {
         float *moe = (float *)malloc(n_embd * sizeof(float));
-        ds4_metal_tensor_read(c->moe_out, 0, moe, n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->moe_out_1xN, 0, moe, n_embd * sizeof(float));
         float sum = 0, mn = moe[0], mx = moe[0]; int nans = 0;
         for (uint32_t i = 0; i < n_embd; i++) {
             if (isnan(moe[i])) { nans++; continue; }
@@ -526,7 +502,7 @@ static int l26f_moe_ffn(
     // Debug shared expert output for layer 1
     if (layer == 1) {
         float *sh = (float *)malloc(n_embd * sizeof(float));
-        ds4_metal_tensor_read(c->shexp_out, 0, sh, n_embd * sizeof(float));
+        ds4_metal_tensor_read(c->shexp_out_1xN, 0, sh, n_embd * sizeof(float));
         float sum = 0; int nans = 0;
         for (uint32_t i = 0; i < n_embd; i++) { if (isnan(sh[i])) nans++; else sum += sh[i]; }
         printf("    shared expert down: sum=%.3f nans=%d\n", sum, nans);
@@ -534,7 +510,7 @@ static int l26f_moe_ffn(
     }
 
     // 11. Residual add: out = inp + moe_out
-    if (!ds4_metal_add_tensor(out, inp, c->moe_out, n_embd))
+    if (!ds4_metal_add_tensor(out, inp, c->moe_out_1xN, n_embd))
         return 0;
 
     return 1;
@@ -554,41 +530,41 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     const uint64_t gla_out_bytes = act_bytes + gla_state_bytes;
 
     // Allocate compute buffers (zeroed — Metal shared memory is uninitialized)
-    s->comp.normed      = ds4_metal_tensor_alloc(act_bytes);
-    s->comp.qkv         = ds4_metal_tensor_alloc(qkv_bytes);
-    s->comp.gate_out    = ds4_metal_tensor_alloc(act_bytes);
-    s->comp.gla_out     = ds4_metal_tensor_alloc(gla_out_bytes);
-    s->comp.attn_proj   = ds4_metal_tensor_alloc(act_bytes);
-    s->comp.post_attn   = ds4_metal_tensor_alloc(act_bytes);
-    s->comp.ffn_normed  = ds4_metal_tensor_alloc(act_bytes);
-    s->comp.ffn_gate    = ds4_metal_tensor_alloc(ffn_bytes);
-    s->comp.ffn_up      = ds4_metal_tensor_alloc(ffn_bytes);
-    s->comp.ffn_mid     = ds4_metal_tensor_alloc(ffn_bytes);
-    s->comp.ffn_down    = ds4_metal_tensor_alloc(act_bytes);
-    s->comp.moe_out     = ds4_metal_tensor_alloc(act_bytes);
-    s->comp.shexp_out   = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.normed_1xN      = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.qkv_1x3N         = ds4_metal_tensor_alloc(qkv_bytes);
+    s->comp.gate_out_1xN    = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.gla_out_1xNxSxSxH     = ds4_metal_tensor_alloc(gla_out_bytes);
+    s->comp.attn_proj_1xN   = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.post_attn_1xN   = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.ffn_normed_1xN  = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.ffn_gate_1xF    = ds4_metal_tensor_alloc(ffn_bytes);
+    s->comp.ffn_up_1xF      = ds4_metal_tensor_alloc(ffn_bytes);
+    s->comp.ffn_mid_1xF     = ds4_metal_tensor_alloc(ffn_bytes);
+    s->comp.ffn_down_1xN    = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.moe_out_1xN     = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.shexp_out_1xN   = ds4_metal_tensor_alloc(act_bytes);
 
-    s->hidden         = ds4_metal_tensor_alloc(act_bytes);
-    s->output_normed  = ds4_metal_tensor_alloc(act_bytes);
-    s->logits         = ds4_metal_tensor_alloc((uint64_t)m->n_vocab * sizeof(float));
+    s->hidden_1xN         = ds4_metal_tensor_alloc(act_bytes);
+    s->output_normed_1xN  = ds4_metal_tensor_alloc(act_bytes);
+    s->logits_1xV         = ds4_metal_tensor_alloc((uint64_t)m->n_vocab * sizeof(float));
 
     // Zero all compute buffers to eliminate uninitialized-memory non-determinism
-    ds4_metal_tensor_fill(s->comp.normed,      0.0f);
-    ds4_metal_tensor_fill(s->comp.qkv,         0.0f);
-    ds4_metal_tensor_fill(s->comp.gate_out,    0.0f);
-    ds4_metal_tensor_fill(s->comp.gla_out,     0.0f);
-    ds4_metal_tensor_fill(s->comp.attn_proj,   0.0f);
-    ds4_metal_tensor_fill(s->comp.post_attn,   0.0f);
-    ds4_metal_tensor_fill(s->comp.ffn_normed,  0.0f);
-    ds4_metal_tensor_fill(s->comp.ffn_gate,    0.0f);
-    ds4_metal_tensor_fill(s->comp.ffn_up,      0.0f);
-    ds4_metal_tensor_fill(s->comp.ffn_mid,     0.0f);
-    ds4_metal_tensor_fill(s->comp.ffn_down,    0.0f);
-    ds4_metal_tensor_fill(s->comp.moe_out,     0.0f);
-    ds4_metal_tensor_fill(s->comp.shexp_out,   0.0f);
-    ds4_metal_tensor_fill(s->hidden,           0.0f);
-    ds4_metal_tensor_fill(s->output_normed,    0.0f);
-    ds4_metal_tensor_fill(s->logits,           0.0f);
+    ds4_metal_tensor_fill(s->comp.normed_1xN,      0.0f);
+    ds4_metal_tensor_fill(s->comp.qkv_1x3N,         0.0f);
+    ds4_metal_tensor_fill(s->comp.gate_out_1xN,    0.0f);
+    ds4_metal_tensor_fill(s->comp.gla_out_1xNxSxSxH,     0.0f);
+    ds4_metal_tensor_fill(s->comp.attn_proj_1xN,   0.0f);
+    ds4_metal_tensor_fill(s->comp.post_attn_1xN,   0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_normed_1xN,  0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_gate_1xF,    0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_up_1xF,      0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_mid_1xF,     0.0f);
+    ds4_metal_tensor_fill(s->comp.ffn_down_1xN,    0.0f);
+    ds4_metal_tensor_fill(s->comp.moe_out_1xN,     0.0f);
+    ds4_metal_tensor_fill(s->comp.shexp_out_1xN,   0.0f);
+    ds4_metal_tensor_fill(s->hidden_1xN,           0.0f);
+    ds4_metal_tensor_fill(s->output_normed_1xN,    0.0f);
+    ds4_metal_tensor_fill(s->logits_1xV,           0.0f);
 
     // GLA states for all GLA layers (28 layers: all except 7, 15, 23, 31)
     for (uint32_t i = 0; i < 32; i++) {
@@ -610,11 +586,11 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
         if (!s->mla_kv[i]) { fprintf(stderr, "l26f: OOM MLA KV cache %u\n", i); return 0; }
     }
 
-    if (!s->comp.normed || !s->comp.qkv || !s->comp.gate_out ||
-        !s->comp.gla_out || !s->comp.attn_proj || !s->comp.post_attn ||
-        !s->comp.ffn_normed || !s->comp.ffn_gate || !s->comp.ffn_up ||
-        !s->comp.ffn_mid || !s->comp.ffn_down ||
-        !s->hidden || !s->output_normed || !s->logits) {
+    if (!s->comp.normed_1xN || !s->comp.qkv_1x3N || !s->comp.gate_out_1xN ||
+        !s->comp.gla_out_1xNxSxSxH || !s->comp.attn_proj_1xN || !s->comp.post_attn_1xN ||
+        !s->comp.ffn_normed_1xN || !s->comp.ffn_gate_1xF || !s->comp.ffn_up_1xF ||
+        !s->comp.ffn_mid_1xF || !s->comp.ffn_down_1xN ||
+        !s->hidden_1xN || !s->output_normed_1xN || !s->logits_1xV) {
         fprintf(stderr, "l26f: OOM compute buffers\n");
         return 0;
     }
@@ -623,22 +599,22 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
 }
 
 static void l26f_session_free(l26f_session *s) {
-    ds4_metal_tensor_free(s->comp.normed);
-    ds4_metal_tensor_free(s->comp.qkv);
-    ds4_metal_tensor_free(s->comp.gate_out);
-    ds4_metal_tensor_free(s->comp.gla_out);
-    ds4_metal_tensor_free(s->comp.attn_proj);
-    ds4_metal_tensor_free(s->comp.post_attn);
-    ds4_metal_tensor_free(s->comp.ffn_normed);
-    ds4_metal_tensor_free(s->comp.ffn_gate);
-    ds4_metal_tensor_free(s->comp.ffn_up);
-    ds4_metal_tensor_free(s->comp.ffn_mid);
-    ds4_metal_tensor_free(s->comp.ffn_down);
-    ds4_metal_tensor_free(s->comp.moe_out);
-    ds4_metal_tensor_free(s->comp.shexp_out);
-    ds4_metal_tensor_free(s->hidden);
-    ds4_metal_tensor_free(s->output_normed);
-    ds4_metal_tensor_free(s->logits);
+    ds4_metal_tensor_free(s->comp.normed_1xN);
+    ds4_metal_tensor_free(s->comp.qkv_1x3N);
+    ds4_metal_tensor_free(s->comp.gate_out_1xN);
+    ds4_metal_tensor_free(s->comp.gla_out_1xNxSxSxH);
+    ds4_metal_tensor_free(s->comp.attn_proj_1xN);
+    ds4_metal_tensor_free(s->comp.post_attn_1xN);
+    ds4_metal_tensor_free(s->comp.ffn_normed_1xN);
+    ds4_metal_tensor_free(s->comp.ffn_gate_1xF);
+    ds4_metal_tensor_free(s->comp.ffn_up_1xF);
+    ds4_metal_tensor_free(s->comp.ffn_mid_1xF);
+    ds4_metal_tensor_free(s->comp.ffn_down_1xN);
+    ds4_metal_tensor_free(s->comp.moe_out_1xN);
+    ds4_metal_tensor_free(s->comp.shexp_out_1xN);
+    ds4_metal_tensor_free(s->hidden_1xN);
+    ds4_metal_tensor_free(s->output_normed_1xN);
+    ds4_metal_tensor_free(s->logits_1xV);
     for (uint32_t i = 0; i < 32; i++) {
         if (s->gla_states[i].state)
             ds4_metal_tensor_free(s->gla_states[i].state);
@@ -682,42 +658,42 @@ static int l26f_embed_token(l26f_session *s, uint32_t token) {
     float *data = (float *)malloc((uint64_t)n_embd * sizeof(float));
     if (!data) return 0;
     l26f_dequant_q8_0_row(m->map + embd->abs_offset, offset, data, n_embd);
-    int ok = ds4_metal_tensor_write(s->hidden, 0, data, (uint64_t)n_embd * sizeof(float));
+    int ok = ds4_metal_tensor_write(s->hidden_1xN, 0, data, (uint64_t)n_embd * sizeof(float));
     free(data);
     return ok;
 }
 
 static int l26f_output_logits(l26f_session *s) {
     l26f_model *m = s->model;
-    l26f_tensor *wt_norm = l26f_model_find_tensor(m, "output_norm.weight");
-    l26f_tensor *wt_out  = l26f_model_find_tensor(m, "output.weight");
-    if (!wt_norm || !wt_out) {
+    l26f_tensor *wt_norm_N   = l26f_model_find_tensor(m, "output_norm.weight");
+    l26f_tensor *wt_out_NxV  = l26f_model_find_tensor(m, "output.weight");
+    if (!wt_norm_N || !wt_out_NxV) {
         fprintf(stderr, "l26f: missing output tensors\n"); return 0;
     }
 
-    if (!ds4_metal_rms_norm_weight_tensor(s->output_normed, s->hidden,
-            m->map, m->size, wt_norm->abs_offset, m->n_embd, m->rms_norm_eps))
+    if (!ds4_metal_rms_norm_weight_tensor(s->output_normed_1xN, s->hidden_1xN,
+            m->map, m->size, wt_norm_N->abs_offset, m->n_embd, m->rms_norm_eps))
         return 0;
 
-    if (!l26f_metal_matvec_quant(s->logits, s->output_normed,
-            m->map, m->size, wt_out->abs_offset,
-            wt_out->dim[0], wt_out->dim[1], wt_out->type, 1))
+    if (!l26f_metal_matvec_quant(s->logits_1xV, s->output_normed_1xN,
+            m->map, m->size, wt_out_NxV->abs_offset,
+            wt_out_NxV->dim[0], wt_out_NxV->dim[1], wt_out_NxV->type, 1))
         return 0;
 
     return 1;
 }
 
 static int32_t l26f_argmax(l26f_session *s) {
-    float *logits = (float *)malloc((uint64_t)s->model->n_vocab * sizeof(float));
-    if (!logits) return -1;
-    ds4_metal_tensor_read(s->logits, 0, logits, (uint64_t)s->model->n_vocab * sizeof(float));
+    float *logits_1xV = (float *)malloc((uint64_t)s->model->n_vocab * sizeof(float));
+    if (!logits_1xV) return -1;
+    ds4_metal_tensor_read(s->logits_1xV, 0, logits_1xV, (uint64_t)s->model->n_vocab * sizeof(float));
 
     int32_t best = 0;
-    float best_v = logits[0];
+    float best_v = logits_1xV[0];
     for (uint32_t i = 1; i < s->model->n_vocab; i++) {
-        if (logits[i] > best_v) { best_v = logits[i]; best = (int32_t)i; }
+        if (logits_1xV[i] > best_v) { best_v = logits_1xV[i]; best = (int32_t)i; }
     }
-    free(logits);
+    free(logits_1xV);
     return best;
 }
 
@@ -725,21 +701,21 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
     for (uint32_t il = 0; il < 32; il++) {
         if (model->is_mla[il]) {
             const uint64_t act_bytes = (uint64_t)model->n_embd * sizeof(float);
-            float *hidden_cpu = (float *)malloc(act_bytes);
-            float *hidden_out = (float *)malloc(act_bytes);
-            ds4_metal_tensor_read(session->hidden, 0, hidden_cpu, act_bytes);
+            float *hidden_cpu_1xN = (float *)malloc(act_bytes);
+            float *hidden_out_1xN = (float *)malloc(act_bytes);
+            ds4_metal_tensor_read(session->hidden_1xN, 0, hidden_cpu_1xN, act_bytes);
             if (!l26f_mla_layer_cpu(model, il, position, session->mla_kv[il],
-                                     hidden_cpu, hidden_out)) {
+                                     hidden_cpu_1xN, hidden_out_1xN)) {
                 fprintf(stderr, "MLA layer %u failed\n", il);
-                free(hidden_cpu); free(hidden_out);
+                free(hidden_cpu_1xN); free(hidden_out_1xN);
                 return 0;
             }
-            ds4_metal_tensor *out = session->comp.post_attn;
-            ds4_metal_tensor_write(out, 0, hidden_out, act_bytes);
-            ds4_metal_tensor_write(session->hidden, 0, hidden_out, act_bytes);
-            free(hidden_cpu); free(hidden_out);
+            ds4_metal_tensor *out_1xN = session->comp.post_attn_1xN;
+            ds4_metal_tensor_write(out_1xN, 0, hidden_out_1xN, act_bytes);
+            ds4_metal_tensor_write(session->hidden_1xN, 0, hidden_out_1xN, act_bytes);
+            free(hidden_cpu_1xN); free(hidden_out_1xN);
 
-            if (!l26f_moe_ffn(session, il, out, session->hidden)) {
+            if (!l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN)) {
                 fprintf(stderr, "MoE FFN layer %u failed\n", il);
                 return 0;
             }
@@ -747,22 +723,22 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
             continue;
         }
 
-        ds4_metal_tensor *inp = session->hidden;
-        ds4_metal_tensor *out = session->comp.post_attn;
+        ds4_metal_tensor *inp_1xN = session->hidden_1xN;
+        ds4_metal_tensor *out_1xN = session->comp.post_attn_1xN;
 
-        if (!l26f_gla_layer(session, il, inp, out)) {
+        if (!l26f_gla_layer(session, il, inp_1xN, out_1xN)) {
             fprintf(stderr, "GLA layer %u failed\n", il);
             return 0;
         }
 
         if (il == 0) {
-            if (!l26f_dense_ffn(session, out, session->hidden)) {
+            if (!l26f_dense_ffn(session, out_1xN, session->hidden_1xN)) {
                 fprintf(stderr, "Dense FFN layer 0 failed\n");
                 return 0;
             }
             if (verbose) printf("  layer %u: GLA + dense FFN\n", il);
         } else {
-            if (!l26f_moe_ffn(session, il, out, session->hidden)) {
+            if (!l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN)) {
                 fprintf(stderr, "MoE FFN layer %u failed\n", il);
                 return 0;
             }
@@ -780,8 +756,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    printf("Loading model...\n");
+    l26f_model model;
+    l26f_model_open(&model, argv[1]);
+
     printf("Loading tokenizer...\n");
-    l26f_tokenizer *tok = l26f_tokenizer_open(argv[1]);
+    l26f_tokenizer *tok = l26f_tokenizer_from_model(&model);
     if (!tok) { fprintf(stderr, "Tokenizer load failed\n"); return 1; }
     printf("  vocab: %u tokens, %u merges, BOS=%d EOS=%d\n",
            tok->n_tokens, tok->n_merges, tok->bos_id, tok->eos_id);
@@ -814,10 +794,6 @@ int main(int argc, char **argv) {
     printf("Starting from token %d (%s), generating %d tokens\n", start_token, tokbuf, n_gen);
 
     int32_t *generated = (int32_t *)malloc(n_gen * sizeof(int32_t));
-
-    printf("Loading model...\n");
-    l26f_model model;
-    l26f_model_open(&model, argv[1]);
 
     printf("Metal init...\n");
     if (!ds4_metal_init()) { fprintf(stderr, "Metal init failed\n"); return 1; }
@@ -860,7 +836,7 @@ int main(int argc, char **argv) {
 
         {
             float *h = (float *)malloc((uint64_t)model.n_embd * sizeof(float));
-            ds4_metal_tensor_read(session.hidden, 0, h, (uint64_t)model.n_embd * sizeof(float));
+            ds4_metal_tensor_read(session.hidden_1xN, 0, h, (uint64_t)model.n_embd * sizeof(float));
             float sum = 0; int nans = 0;
             for (uint32_t i = 0; i < model.n_embd; i++) {
                 if (isnan(h[i])) nans++;

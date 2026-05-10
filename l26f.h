@@ -97,6 +97,14 @@ typedef struct {
     bool     is_mla[L26F_MAX_LAYERS];
     uint32_t nextn_predict_layers;
     uint32_t expert_shared_count;
+
+    uint64_t tok_tokens_pos;
+    uint64_t tok_tokens_count;
+    uint64_t tok_merges_pos;
+    uint64_t tok_merges_count;
+    int32_t  tok_bos_id;
+    int32_t  tok_eos_id;
+    bool     tok_found;
 } l26f_model;
 
 // ---- GGUF file format constants ----

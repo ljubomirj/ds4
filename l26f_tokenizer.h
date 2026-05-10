@@ -1,14 +1,7 @@
 #ifndef L26F_TOKENIZER_H
 #define L26F_TOKENIZER_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <string.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "l26f.h"
 
 typedef struct {
     char *text;
@@ -21,16 +14,12 @@ typedef struct {
 } l26f_token_map_entry;
 
 typedef struct {
-    char *left_text;    // points into allocated string (owns the allocation)
-    char *right_text;   // points into same string after the space
+    char *left_text;
+    char *right_text;
     uint32_t rank;
 } l26f_merge;
 
 typedef struct {
-    int fd;
-    const uint8_t *map;
-    uint64_t map_size;
-
     l26f_token_entry *tokens;
     uint32_t n_tokens;
 
@@ -43,9 +32,14 @@ typedef struct {
     int32_t bos_id;
     int32_t eos_id;
     int32_t unk_id;
+
+    uint64_t tokens_data_pos;
+    uint64_t merges_data_pos;
+    bool loaded;
 } l26f_tokenizer;
 
 l26f_tokenizer *l26f_tokenizer_open(const char *path);
+l26f_tokenizer *l26f_tokenizer_from_model(const l26f_model *m);
 void l26f_tokenizer_close(l26f_tokenizer *t);
 
 int l26f_token_decode(const l26f_tokenizer *t, int32_t token_id, char *buf, int buf_size);

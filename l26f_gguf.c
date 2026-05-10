@@ -143,6 +143,31 @@ static void l26f_parse_metadata(l26f_model *m, l26f_cursor *c) {
             float v = 0; l26f_cursor_f32(c, &v); m->rope_theta = v;
         } else if (l26f_str_eq(key, "bailing_hybrid.attention.layer_norm_rms_epsilon")) {
             float v = 0; l26f_cursor_f32(c, &v); m->rms_norm_eps = v;
+        } else if (l26f_str_eq(key, "tokenizer.ggml.tokens") && type == L26F_GGUF_ARRAY) {
+            uint32_t it; uint64_t al;
+            if (!l26f_cursor_u32(c, &it)) return;
+            if (!l26f_cursor_u64(c, &al)) return;
+            m->tok_tokens_pos = (uint64_t)(c->ptr - m->map);
+            m->tok_tokens_count = al;
+            m->tok_found = true;
+            uint64_t ss = l26f_scalar_size(it);
+            if (ss) { if (!l26f_cursor_skip(c, al * ss)) return; }
+            else { for (uint64_t j = 0; j < al; j++) if (!l26f_skip_value(c, it, 1)) return; }
+        } else if (l26f_str_eq(key, "tokenizer.ggml.merges") && type == L26F_GGUF_ARRAY) {
+            uint32_t it; uint64_t al;
+            if (!l26f_cursor_u32(c, &it)) return;
+            if (!l26f_cursor_u64(c, &al)) return;
+            m->tok_merges_pos = (uint64_t)(c->ptr - m->map);
+            m->tok_merges_count = al;
+            uint64_t ss = l26f_scalar_size(it);
+            if (ss) { if (!l26f_cursor_skip(c, al * ss)) return; }
+            else { for (uint64_t j = 0; j < al; j++) if (!l26f_skip_value(c, it, 1)) return; }
+        } else if (l26f_str_eq(key, "tokenizer.ggml.bos_token_id") && type == L26F_GGUF_UINT32) {
+            l26f_cursor_u32(c, (uint32_t *)&m->tok_bos_id);
+        } else if (l26f_str_eq(key, "tokenizer.ggml.eos_token_id") && type == L26F_GGUF_UINT32) {
+            l26f_cursor_u32(c, (uint32_t *)&m->tok_eos_id);
+        } else if (l26f_str_eq(key, "tokenizer.ggml.unknown_token_id") && type == L26F_GGUF_UINT32) {
+            int32_t v = 0; l26f_cursor_read(c, &v, 4);
         } else if (l26f_str_eq(key, "bailing_hybrid.nextn_predict_layers")) {
             uint32_t v = 0; l26f_cursor_u32(c, &v); m->nextn_predict_layers = v;
         } else if (l26f_str_eq(key, "bailing_hybrid.expert_shared_count")) {
