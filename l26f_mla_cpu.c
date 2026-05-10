@@ -198,15 +198,15 @@ static void cpu_softmax(float *x, int n) {
 // ---- MLA KV cache ----
 
 typedef struct {
-    float *data;        // [max_seq_len, kv_dim]  where kv_dim = kv_lora_rank + n_rot
+    float *data_TxCR;
     int    max_seq_len;
     int    kv_dim;
-    int    n_tokens;    // current number of cached tokens
+    int    n_tokens;
 } l26f_mla_kv_cache;
 
 l26f_mla_kv_cache *l26f_mla_kv_cache_alloc(int max_seq, int kv_dim) {
     l26f_mla_kv_cache *c = (l26f_mla_kv_cache *)calloc(1, sizeof(*c));
-    c->data = (float *)calloc((uint64_t)max_seq * kv_dim, sizeof(float));
+    c->data_TxCR = (float *)calloc((uint64_t)max_seq * kv_dim, sizeof(float));
     c->max_seq_len = max_seq;
     c->kv_dim = kv_dim;
     c->n_tokens = 0;
@@ -215,7 +215,7 @@ l26f_mla_kv_cache *l26f_mla_kv_cache_alloc(int max_seq, int kv_dim) {
 
 void l26f_mla_kv_cache_free(l26f_mla_kv_cache *c) {
     if (!c) return;
-    free(c->data);
+    free(c->data_TxCR);
     free(c);
 }
 
@@ -246,66 +246,61 @@ int l26f_mla_layer_cpu(
         if (!t_##suffix) t_##suffix = l26f_model_find_tensor(m, name); \
     } while(0)
 
-    l26f_tensor *t_attn_norm = NULL, *t_q_a = NULL, *t_q_a_norm = NULL;
-    l26f_tensor *t_q_b = NULL, *t_kv_a_mqa = NULL, *t_kv_a_norm = NULL;
-    l26f_tensor *t_k_b = NULL, *t_v_b = NULL, *t_output = NULL;
+    l26f_tensor *t_attn_norm_N   = NULL, *t_q_a_NxQ = NULL, *t_q_a_norm_Q = NULL;
+    l26f_tensor *t_q_b_QxHxD    = NULL, *t_kv_a_mqa_NxCR = NULL, *t_kv_a_norm_C = NULL;
+    l26f_tensor *t_k_b_PxCxH    = NULL, *t_v_b_CxPxH = NULL, *t_output_NxN = NULL;
 
     snprintf(name, sizeof(name), "blk.%u.attn_norm.weight", layer);
-    t_attn_norm = l26f_model_find_tensor(m, name);
+    t_attn_norm_N = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_q_a.weight", layer);
-    t_q_a = l26f_model_find_tensor(m, name);
+    t_q_a_NxQ = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_q_a_norm.weight", layer);
-    t_q_a_norm = l26f_model_find_tensor(m, name);
+    t_q_a_norm_Q = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_q_b.weight", layer);
-    t_q_b = l26f_model_find_tensor(m, name);
+    t_q_b_QxHxD = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_kv_a_mqa.weight", layer);
-    t_kv_a_mqa = l26f_model_find_tensor(m, name);
+    t_kv_a_mqa_NxCR = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_kv_a_norm.weight", layer);
-    t_kv_a_norm = l26f_model_find_tensor(m, name);
+    t_kv_a_norm_C = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_k_b.weight", layer);
-    t_k_b = l26f_model_find_tensor(m, name);
+    t_k_b_PxCxH = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_v_b.weight", layer);
-    t_v_b = l26f_model_find_tensor(m, name);
+    t_v_b_CxPxH = l26f_model_find_tensor(m, name);
     snprintf(name, sizeof(name), "blk.%u.attn_output.weight", layer);
-    t_output = l26f_model_find_tensor(m, name);
+    t_output_NxN = l26f_model_find_tensor(m, name);
 
-    if (!t_attn_norm || !t_q_a || !t_q_a_norm || !t_q_b || !t_kv_a_mqa ||
-        !t_kv_a_norm || !t_k_b || !t_v_b || !t_output) {
+    if (!t_attn_norm_N || !t_q_a_NxQ || !t_q_a_norm_Q || !t_q_b_QxHxD || !t_kv_a_mqa_NxCR ||
+        !t_kv_a_norm_C || !t_k_b_PxCxH || !t_v_b_CxPxH || !t_output_NxN) {
         fprintf(stderr, "l26f: MLA layer %u missing tensors\n", layer);
         return 0;
     }
 
     const uint8_t *model_base = m->map;
-    float *normed     = (float *)malloc(n_embd * sizeof(float));
-    float *q_a        = (float *)malloc(q_lora_rank * sizeof(float));
-    float *q_a_normed = (float *)malloc(q_lora_rank * sizeof(float));
-    float *q_b        = (float *)malloc((uint64_t)n_head * head_dim * sizeof(float));
-    float *kv_a       = (float *)malloc(kv_dim * sizeof(float));
-    float *kv_cmpr    = (float *)malloc(kv_lora_rank * sizeof(float));
-    float *q_absorbed = (float *)malloc((uint64_t)n_head * kv_lora_rank * sizeof(float));
-    float *v_decomp   = (float *)malloc((uint64_t)n_head * 128 * sizeof(float)); // 128 = v dim
-    float *attn_out   = (float *)malloc(kv_lora_rank * sizeof(float));
-    float *scores     = (float *)malloc((kv_cache->n_tokens + 1) * sizeof(float));
-    float *attn_result = (float *)malloc((uint64_t)n_head * kv_lora_rank * sizeof(float));
-    float *out_proj_in = (float *)malloc(n_embd * sizeof(float));
-    float *attn_proj   = (float *)malloc(n_embd * sizeof(float));
+    float *normed_1xN      = (float *)malloc(n_embd * sizeof(float));
+    float *q_a_1xQ         = (float *)malloc(q_lora_rank * sizeof(float));
+    float *q_a_normed_1xQ  = (float *)malloc(q_lora_rank * sizeof(float));
+    float *q_b_1xHxD       = (float *)malloc((uint64_t)n_head * head_dim * sizeof(float));
+    float *kv_a_1xCR      = (float *)malloc(kv_dim * sizeof(float));
+    float *kv_cmpr_1xC     = (float *)malloc(kv_lora_rank * sizeof(float));
+    float *q_absorbed_HxC  = (float *)malloc((uint64_t)n_head * kv_lora_rank * sizeof(float));
+    float *v_decomp_HxP    = (float *)malloc((uint64_t)n_head * 128 * sizeof(float));
+    float *attn_out_1xC    = (float *)malloc(kv_lora_rank * sizeof(float));
+    float *scores_1xT      = (float *)malloc((kv_cache->n_tokens + 1) * sizeof(float));
+    float *attn_result_HxC = (float *)malloc((uint64_t)n_head * kv_lora_rank * sizeof(float));
+    float *out_proj_in_1xN = (float *)malloc(n_embd * sizeof(float));
+    float *attn_proj_1xN   = (float *)malloc(n_embd * sizeof(float));
 
-    // 1. RMS norm
-    const float *w_norm = (const float *)(model_base + t_attn_norm->abs_offset);
-    cpu_rms_norm(hidden_cpu, w_norm, normed, n_embd, eps);
+    const float *w_norm_1xN = (const float *)(model_base + t_attn_norm_N->abs_offset);
+    cpu_rms_norm(hidden_cpu, w_norm_1xN, normed_1xN, n_embd, eps);
 
-    // 2. Q compression
-    // wq_a: [n_embd, q_lora_rank] → matvec: input [n_embd] → output [q_lora_rank]
-    cpu_matvec(model_base + t_q_a->abs_offset, normed, q_a,
-               t_q_a->type, q_lora_rank, n_embd);
+    cpu_matvec(model_base + t_q_a_NxQ->abs_offset, normed_1xN, q_a_1xQ,
+               t_q_a_NxQ->type, q_lora_rank, n_embd);
 
-    // RMS norm on compressed Q
-    const float *w_q_a_norm = (const float *)(model_base + t_q_a_norm->abs_offset);
-    cpu_rms_norm(q_a, w_q_a_norm, q_a_normed, q_lora_rank, eps);
+    const float *w_q_a_norm_1xQ = (const float *)(model_base + t_q_a_norm_Q->abs_offset);
+    cpu_rms_norm(q_a_1xQ, w_q_a_norm_1xQ, q_a_normed_1xQ, q_lora_rank, eps);
 
-    // Q expansion: [q_lora_rank, n_head*head_dim]
-    cpu_matvec(model_base + t_q_b->abs_offset, q_a_normed, q_b,
-               t_q_b->type, n_head * head_dim, q_lora_rank);
+    cpu_matvec(model_base + t_q_b_QxHxD->abs_offset, q_a_normed_1xQ, q_b_1xHxD,
+               t_q_b_QxHxD->type, n_head * head_dim, q_lora_rank);
 
     // Split Q into q_nope [n_head, qk_nope] and q_pe [n_head, n_rot]
     // q_b layout: [n_head * head_dim] = for each head, first qk_nope=128 then n_rot=64
@@ -314,129 +309,101 @@ int l26f_mla_layer_cpu(
 
     // Apply RoPE to q_pe
     for (uint32_t h = 0; h < n_head; h++) {
-        float *q_pe_h = q_b + h * head_dim + qk_nope;
-        cpu_rope(q_pe_h, n_rot, position, m->rope_theta);
+        float *q_pe_h_R = q_b_1xHxD + h * head_dim + qk_nope;
+        cpu_rope(q_pe_h_R, n_rot, position, m->rope_theta);
     }
 
-    // 3. KV compression
-    // wkv_a_mqa: [n_embd, kv_dim] → matvec: input [n_embd] → output [kv_dim]
-    cpu_matvec(model_base + t_kv_a_mqa->abs_offset, normed, kv_a,
-               t_kv_a_mqa->type, kv_dim, n_embd);
+    cpu_matvec(model_base + t_kv_a_mqa_NxCR->abs_offset, normed_1xN, kv_a_1xCR,
+               t_kv_a_mqa_NxCR->type, kv_dim, n_embd);
 
-    // Split kv_a into kv_cmpr [kv_lora_rank] and k_pe [n_rot]
-    memcpy(kv_cmpr, kv_a, kv_lora_rank * sizeof(float));
-    float *k_pe = kv_a + kv_lora_rank;  // last n_rot elements
+    memcpy(kv_cmpr_1xC, kv_a_1xCR, kv_lora_rank * sizeof(float));
+    float *k_pe_R = kv_a_1xCR + kv_lora_rank;
 
-    // RMS norm on compressed KV
-    const float *w_kv_a_norm = (const float *)(model_base + t_kv_a_norm->abs_offset);
-    cpu_rms_norm(kv_cmpr, w_kv_a_norm, kv_cmpr, kv_lora_rank, eps);
+    const float *w_kv_a_norm_1xC = (const float *)(model_base + t_kv_a_norm_C->abs_offset);
+    cpu_rms_norm(kv_cmpr_1xC, w_kv_a_norm_1xC, kv_cmpr_1xC, kv_lora_rank, eps);
 
-    // Apply RoPE to k_pe
-    cpu_rope(k_pe, n_rot, position, m->rope_theta);
+    cpu_rope(k_pe_R, n_rot, position, m->rope_theta);
 
     // 4. Absorption: q_absorbed[h] = wk_b[:,:,h] × q_nope[:,h]
     // wk_b: [qk_nope, kv_lora_rank, n_head] (dim[0]=128, dim[1]=512, dim[2]=32)
     // q_nope[:,h]: [qk_nope] = [128]
     // result: [kv_lora_rank]
     {
-        const uint64_t head_bytes = (uint64_t)(t_k_b->dim[1]) * cpu_row_bytes(t_k_b->type, t_k_b->dim[0]);
-        float *row_buf = (float *)malloc(t_k_b->dim[0] * sizeof(float));
+        const uint64_t head_bytes = (uint64_t)(t_k_b_PxCxH->dim[1]) * cpu_row_bytes(t_k_b_PxCxH->type, t_k_b_PxCxH->dim[0]);
+        float *row_buf = (float *)malloc(t_k_b_PxCxH->dim[0] * sizeof(float));
         for (uint32_t h = 0; h < n_head; h++) {
-            const uint8_t *wk_b_h = model_base + t_k_b->abs_offset + h * head_bytes;
-            const float *q_nope_h = q_b + h * head_dim;  // first qk_nope elements of q for head h
-            // wk_b_h is [qk_nope, kv_lora_rank], q_nope_h is [qk_nope]
-            // matvec: output [kv_lora_rank]
-            cpu_matvec(wk_b_h, q_nope_h, q_absorbed + h * kv_lora_rank,
-                       t_k_b->type, t_k_b->dim[1], t_k_b->dim[0]);
+            const uint8_t *wk_b_h_PxC = model_base + t_k_b_PxCxH->abs_offset + h * head_bytes;
+            const float *q_nope_h_P = q_b_1xHxD + h * head_dim;
+            cpu_matvec(wk_b_h_PxC, q_nope_h_P, q_absorbed_HxC + h * kv_lora_rank,
+                       t_k_b_PxCxH->type, t_k_b_PxCxH->dim[1], t_k_b_PxCxH->dim[0]);
         }
         free(row_buf);
     }
 
-    // 5. Update KV cache
     {
-        float *k_new = kv_cache->data + (uint64_t)kv_cache->n_tokens * kv_dim;
-        memcpy(k_new, kv_cmpr, kv_lora_rank * sizeof(float));
-        memcpy(k_new + kv_lora_rank, k_pe, n_rot * sizeof(float));
+        float *k_new_1xCR = kv_cache->data_TxCR + (uint64_t)kv_cache->n_tokens * kv_dim;
+        memcpy(k_new_1xCR, kv_cmpr_1xC, kv_lora_rank * sizeof(float));
+        memcpy(k_new_1xCR + kv_lora_rank, k_pe_R, n_rot * sizeof(float));
         kv_cache->n_tokens++;
     }
 
-    // 6. Attention (MQA: 1 KV head, n_head Q heads)
-    // Q_h = [q_absorbed[h] | q_pe[h]]  → [kv_dim]
-    // K_cache = [kv_cmpr_0, k_pe_0, kv_cmpr_1, k_pe_1, ...]
-    // V for attention = the kv_cmpr part of each cached entry (first kv_lora_rank floats)
     {
         const int n_cached = kv_cache->n_tokens;
         const float q_scale = 1.0f / sqrtf((float)kv_dim);
 
         for (uint32_t h = 0; h < n_head; h++) {
-            // Compute attention scores
             for (int t = 0; t < n_cached; t++) {
-                const float *k_t = kv_cache->data + (uint64_t)t * kv_dim;
+                const float *k_t_1xCR = kv_cache->data_TxCR + (uint64_t)t * kv_dim;
                 float dot = 0;
-                // Dot product of Q_h with K_t
                 for (uint32_t d = 0; d < kv_lora_rank; d++) {
-                    dot += q_absorbed[h * kv_lora_rank + d] * k_t[d];
+                    dot += q_absorbed_HxC[h * kv_lora_rank + d] * k_t_1xCR[d];
                 }
-                // RoPE part: q_pe and k_pe
                 for (uint32_t d = 0; d < n_rot; d++) {
-                    float q_val = q_b[h * head_dim + qk_nope + d];
-                    float k_val = k_t[kv_lora_rank + d];
+                    float q_val = q_b_1xHxD[h * head_dim + qk_nope + d];
+                    float k_val = k_t_1xCR[kv_lora_rank + d];
                     dot += q_val * k_val;
                 }
-                scores[t] = dot * q_scale;
+                scores_1xT[t] = dot * q_scale;
             }
 
-            // Softmax
-            cpu_softmax(scores, n_cached);
+            cpu_softmax(scores_1xT, n_cached);
 
-            // Weighted sum of V (V = kv_cmpr part of cache)
-            float *attn_h = attn_result + h * kv_lora_rank;
-            memset(attn_h, 0, kv_lora_rank * sizeof(float));
+            float *attn_h_1xC = attn_result_HxC + h * kv_lora_rank;
+            memset(attn_h_1xC, 0, kv_lora_rank * sizeof(float));
             for (int t = 0; t < n_cached; t++) {
-                const float *v_t = kv_cache->data + (uint64_t)t * kv_dim;  // V = same as kv_cmpr
-                float w = scores[t];
+                const float *v_t_1xCR = kv_cache->data_TxCR + (uint64_t)t * kv_dim;
+                float w = scores_1xT[t];
                 for (uint32_t d = 0; d < kv_lora_rank; d++) {
-                    attn_h[d] += w * v_t[d];
+                    attn_h_1xC[d] += w * v_t_1xCR[d];
                 }
             }
         }
     }
 
-    // 7. V decompression: v_decomp[h] = wv_b[:,:,h] × attn_result[h]
-    // wv_b: [kv_lora_rank, 128, n_head] (dim[0]=512, dim[1]=128, dim[2]=32)
-    // attn_result[h]: [kv_lora_rank]
-    // output: [128]
     {
-        const uint64_t head_bytes = (uint64_t)(t_v_b->dim[1]) * cpu_row_bytes(t_v_b->type, t_v_b->dim[0]);
+        const uint64_t head_bytes = (uint64_t)(t_v_b_CxPxH->dim[1]) * cpu_row_bytes(t_v_b_CxPxH->type, t_v_b_CxPxH->dim[0]);
         for (uint32_t h = 0; h < n_head; h++) {
-            const uint8_t *wv_b_h = model_base + t_v_b->abs_offset + h * head_bytes;
-            const float *attn_h = attn_result + h * kv_lora_rank;
-            // wv_b_h is [kv_lora_rank, 128], attn_h is [kv_lora_rank]
-            // matvec: output [128]
-            cpu_matvec(wv_b_h, attn_h, v_decomp + h * 128,
-                       t_v_b->type, t_v_b->dim[1], t_v_b->dim[0]);
+            const uint8_t *wv_b_h_CxP = model_base + t_v_b_CxPxH->abs_offset + h * head_bytes;
+            const float *attn_h_1xC = attn_result_HxC + h * kv_lora_rank;
+            cpu_matvec(wv_b_h_CxP, attn_h_1xC, v_decomp_HxP + h * 128,
+                       t_v_b_CxPxH->type, t_v_b_CxPxH->dim[1], t_v_b_CxPxH->dim[0]);
         }
     }
 
-    // 8. Output projection
-    // Concatenate v_decomp into out_proj_in [n_head * 128 = 4096]
     for (uint32_t h = 0; h < n_head; h++) {
-        memcpy(out_proj_in + h * 128, v_decomp + h * 128, 128 * sizeof(float));
+        memcpy(out_proj_in_1xN + h * 128, v_decomp_HxP + h * 128, 128 * sizeof(float));
     }
-    // wo: [n_embd, n_embd] = [4096, 4096]
-    cpu_matvec(model_base + t_output->abs_offset, out_proj_in, attn_proj,
-               t_output->type, n_embd, n_embd);
+    cpu_matvec(model_base + t_output_NxN->abs_offset, out_proj_in_1xN, attn_proj_1xN,
+               t_output_NxN->type, n_embd, n_embd);
 
-    // 9. Residual add
     for (uint32_t i = 0; i < n_embd; i++) {
-        hidden_out_cpu[i] = hidden_cpu[i] + attn_proj[i];
+        hidden_out_cpu[i] = hidden_cpu[i] + attn_proj_1xN[i];
     }
 
-    // Cleanup
-    free(normed); free(q_a); free(q_a_normed); free(q_b);
-    free(kv_a); free(kv_cmpr); free(q_absorbed); free(v_decomp);
-    free(attn_out); free(scores); free(attn_result);
-    free(out_proj_in); free(attn_proj);
+    free(normed_1xN); free(q_a_1xQ); free(q_a_normed_1xQ); free(q_b_1xHxD);
+    free(kv_a_1xCR); free(kv_cmpr_1xC); free(q_absorbed_HxC); free(v_decomp_HxP);
+    free(attn_out_1xC); free(scores_1xT); free(attn_result_HxC);
+    free(out_proj_in_1xN); free(attn_proj_1xN);
 
     return 1;
 }
