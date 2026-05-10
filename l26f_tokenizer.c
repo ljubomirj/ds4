@@ -181,17 +181,10 @@ int l26f_token_decode(const l26f_tokenizer *t, int32_t token_id, char *buf, int 
         return n;
     }
 
-    int out = 0;
-    for (uint32_t i = 0; i < len && out < buf_size - 1; i++) {
-        uint8_t b = (uint8_t)raw[i];
-        if (b < 128) {
-            buf[out++] = (char)b;
-        } else {
-            buf[out++] = (char)gpt2_unicode_to_byte[b % 256];
-        }
-    }
-    buf[out] = 0;
-    return out;
+    int n = len < (uint32_t)(buf_size - 1) ? (int)len : buf_size - 1;
+    memcpy(buf, raw, n);
+    buf[n] = 0;
+    return n;
 }
 
 static int32_t l26f_token_lookup(const l26f_tokenizer *t, const char *text, uint32_t len) {

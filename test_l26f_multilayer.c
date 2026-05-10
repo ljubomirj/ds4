@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <ctype.h>
 #include "l26f.h"
 #include "l26f_metal.h"
@@ -719,18 +720,99 @@ static int l26f_output_logits(l26f_session *s) {
     return 1;
 }
 
-static int32_t l26f_argmax(l26f_session *s) {
-    float *logits_1xV = (float *)malloc((uint64_t)s->model->n_vocab * sizeof(float));
-    if (!logits_1xV) return -1;
-    ds4_metal_tensor_read(s->logits_1xV, 0, logits_1xV, (uint64_t)s->model->n_vocab * sizeof(float));
+typedef struct {
+    float temperature;
+    int32_t top_k;
+    float top_p;
+    uint64_t seed;
+} l26f_sample_params;
 
-    int32_t best = 0;
-    float best_v = logits_1xV[0];
-    for (uint32_t i = 1; i < s->model->n_vocab; i++) {
-        if (logits_1xV[i] > best_v) { best_v = logits_1xV[i]; best = (int32_t)i; }
+static uint64_t l26f_rng_next(uint64_t *state) {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    return *state;
+}
+
+static float l26f_rng_float(uint64_t *state) {
+    return (float)(l26f_rng_next(state) & 0xFFFFFF) / (float)0x1000000;
+}
+
+typedef struct {
+    float val;
+    int32_t idx;
+} l26f_logit_entry;
+
+static int l26f_logit_cmp_desc(const void *a, const void *b) {
+    float fa = ((const l26f_logit_entry *)a)->val;
+    float fb = ((const l26f_logit_entry *)b)->val;
+    return (fa < fb) - (fa > fb);
+}
+
+static int32_t l26f_sample(l26f_session *s, const l26f_sample_params *p, uint64_t *rng) {
+    const uint32_t V = s->model->n_vocab;
+    float *logits = (float *)malloc((uint64_t)V * sizeof(float));
+    if (!logits) return -1;
+    ds4_metal_tensor_read(s->logits_1xV, 0, logits, (uint64_t)V * sizeof(float));
+
+    if (p->temperature <= 0.0f) {
+        int32_t best = 0;
+        for (uint32_t i = 1; i < V; i++)
+            if (logits[i] > logits[best]) best = (int32_t)i;
+        free(logits);
+        return best;
     }
-    free(logits_1xV);
-    return best;
+
+    for (uint32_t i = 0; i < V; i++) logits[i] /= p->temperature;
+
+    l26f_logit_entry *entries = (l26f_logit_entry *)malloc((uint64_t)V * sizeof(l26f_logit_entry));
+    for (uint32_t i = 0; i < V; i++) {
+        entries[i].val = logits[i];
+        entries[i].idx = (int32_t)i;
+    }
+
+    int32_t k = V;
+    if (p->top_k > 0 && p->top_k < (int32_t)V) k = p->top_k;
+    int32_t partial = (k < V) ? k : V;
+    if (partial < V) {
+        qsort(entries, V, sizeof(l26f_logit_entry), l26f_logit_cmp_desc);
+    }
+
+    float max_v = entries[0].val;
+    for (int32_t i = 0; i < partial; i++)
+        entries[i].val = expf(entries[i].val - max_v);
+
+    if (p->top_p < 1.0f) {
+        float cumsum = 0.0f, total = 0.0f;
+        for (int32_t i = 0; i < partial; i++) total += entries[i].val;
+        for (int32_t i = 0; i < partial; i++) {
+            cumsum += entries[i].val;
+            if (cumsum / total > p->top_p) {
+                partial = i + 1;
+                break;
+            }
+        }
+    }
+
+    float sum = 0.0f;
+    for (int32_t i = 0; i < partial; i++) sum += entries[i].val;
+    float r = l26f_rng_float(rng) * sum;
+    int32_t result = entries[partial - 1].idx;
+    float cumsum = 0.0f;
+    for (int32_t i = 0; i < partial; i++) {
+        cumsum += entries[i].val;
+        if (cumsum >= r) { result = entries[i].idx; break; }
+    }
+
+    free(entries);
+    free(logits);
+    return result;
+}
+
+static int32_t l26f_argmax(l26f_session *s) {
+    l26f_sample_params p = {0, 0, 1.0f, 0};
+    uint64_t rng = 0;
+    return l26f_sample(s, &p, &rng);
 }
 
 static int l26f_forward_pass(l26f_session *session, l26f_model *model, int position, bool verbose) {
@@ -801,9 +883,10 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf> [prompt_or_token] [n_gen]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> [prompt_or_token] [n_gen] [temp] [top_k] [top_p]\n", argv[0]);
         fprintf(stderr, "  If prompt starts with a digit, treated as token ID\n");
         fprintf(stderr, "  Otherwise, tokenized as text\n");
+        fprintf(stderr, "  temp=0 → greedy (argmax), default=0.8\n");
         return 1;
     }
 
@@ -840,6 +923,14 @@ int main(int argc, char **argv) {
     }
     int n_gen = argc > 3 ? atoi(argv[3]) : 16;
 
+    l26f_sample_params sample_params = {
+        .temperature = argc > 4 ? (float)atof(argv[4]) : 0.0f,
+        .top_k       = argc > 5 ? atoi(argv[5]) : 40,
+        .top_p       = argc > 6 ? (float)atof(argv[6]) : 0.95f,
+        .seed        = 42
+    };
+    uint64_t rng = sample_params.seed;
+
     char tokbuf[256];
     l26f_token_decode(tok, start_token, tokbuf, sizeof(tokbuf));
     printf("Starting from token %d (%s), generating %d tokens\n", start_token, tokbuf, n_gen);
@@ -864,8 +955,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Embed failed\n"); return 1;
     }
 
-    printf("Generating %d tokens from token %d...\n", n_gen, start_token);
+    printf("Generating %d tokens from token %d (temp=%.2f, top_k=%d, top_p=%.2f)...\n",
+           n_gen, start_token, sample_params.temperature, sample_params.top_k, sample_params.top_p);
     int32_t current_token = start_token;
+    int n_generated = 0;
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     for (int gen = 0; gen < n_gen; gen++) {
         printf("\n--- Token %d (input=%d) ---\n", gen, current_token);
@@ -880,26 +975,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Output projection failed\n"); return 1;
         }
 
-        int32_t next_token = l26f_argmax(&session);
+        int32_t next_token = l26f_sample(&session, &sample_params, &rng);
         l26f_token_decode(tok, next_token, tokbuf, sizeof(tokbuf));
         printf("  -> token %d: \"%s\"\n", next_token, tokbuf);
         generated[gen] = next_token;
+        n_generated = gen + 1;
 
-        {
-            float *h = (float *)malloc((uint64_t)model.n_embd * sizeof(float));
-            ds4_metal_tensor_read(session.hidden_1xN, 0, h, (uint64_t)model.n_embd * sizeof(float));
-            float sum = 0; int nans = 0;
-            for (uint32_t i = 0; i < model.n_embd; i++) {
-                if (isnan(h[i])) nans++;
-                sum += h[i];
-            }
-            if (nans > 0 || verbose) printf("  hidden: sum=%.3f nans=%d\n", sum, nans);
-            free(h);
+        if (next_token == tok->eos_id) {
+            printf("  (EOS reached)\n");
+            break;
         }
 
         current_token = next_token;
 
-        // Embed next token for next iteration
         if (gen + 1 < n_gen) {
             if (!l26f_embed_token(&session, (uint32_t)current_token)) {
                 fprintf(stderr, "Embed failed for token %d\n", current_token);
@@ -908,9 +996,13 @@ int main(int argc, char **argv) {
         }
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
     printf("\nFull text: ");
-    l26f_text_decode(tok, generated, n_gen, tokbuf, sizeof(tokbuf));
+    l26f_text_decode(tok, generated, n_generated, tokbuf, sizeof(tokbuf));
     printf("%s\n", tokbuf);
+    printf("\n%d tokens in %.3fs (%.1f tok/s)\n", n_generated, elapsed,
+           n_generated > 0 ? (double)n_generated / elapsed : 0.0);
 
     l26f_session_free(&session);
     ds4_metal_cleanup();
