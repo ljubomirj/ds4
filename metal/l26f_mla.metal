@@ -231,3 +231,65 @@ kernel void kernel_l26f_batch_iq4_nl_matvec(
 
     output[idx] = sum;
 }
+
+// ---- Strided Extract ----
+//
+// Extract n_vectors strided slices from src into contiguous dst.
+// For vector v, element j:
+//   dst[v * slice_len + j] = src[v * src_stride + src_offset + j]
+//
+// Used for:
+//   - q_pe extraction: slice_len=R=64, src_stride=head_dim=192, src_offset=qk_nope=128
+//   - q_nope extraction: slice_len=P=128, src_stride=head_dim=192, src_offset=0
+
+typedef struct {
+    int32_t n_vectors;
+    int32_t slice_len;
+    int32_t src_stride;
+    int32_t src_offset;
+} l26f_kargs_strided_extract;
+
+kernel void kernel_l26f_strided_extract(
+        constant l26f_kargs_strided_extract & args [[buffer(0)]],
+        device const float                   * src  [[buffer(1)]],
+        device       float                   * dst  [[buffer(2)]],
+        uint2 gid [[thread_position_in_grid]])
+{
+    const int v = (int)gid.y;
+    const int j = (int)gid.x;
+    if (v >= args.n_vectors || j >= args.slice_len) return;
+
+    dst[(uint64_t)v * args.slice_len + j] =
+        src[(uint64_t)v * args.src_stride + args.src_offset + j];
+}
+
+// ---- KV Cache Append ----
+//
+// Append one token's kv_cmpr[C] + k_pe[R] to GPU-side KV cache at position n_cached.
+// cache: [max_seq * CR] float
+// After append, cache[n_cached][0:C] = kv_cmpr, cache[n_cached][C:CR] = k_pe
+
+typedef struct {
+    int32_t kv_lora_rank;
+    int32_t n_rot;
+    int32_t n_cached;
+} l26f_kargs_kv_append;
+
+kernel void kernel_l26f_kv_append(
+        constant l26f_kargs_kv_append & args   [[buffer(0)]],
+        device const float             * kv_cmpr [[buffer(1)]],
+        device const float             * k_pe    [[buffer(2)]],
+        device       float             * cache   [[buffer(3)]],
+        uint gid [[thread_position_in_grid]])
+{
+    const int C = args.kv_lora_rank;
+    const int R = args.n_rot;
+    const int CR = C + R;
+    const int pos = args.n_cached;
+
+    if ((int)gid < C) {
+        cache[(uint64_t)pos * CR + gid] = kv_cmpr[gid];
+    } else if ((int)gid < CR) {
+        cache[(uint64_t)pos * CR + gid] = k_pe[gid - C];
+    }
+}

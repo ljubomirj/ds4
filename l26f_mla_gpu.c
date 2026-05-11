@@ -263,29 +263,11 @@ int l26f_mla_layer_gpu(
 
     // --- Step 5: RoPE on q_pe ---
     // q_b layout: [n_head * head_dim] = for each head, first qk_nope=128 then n_rot=64
-    // We need to extract q_pe for each head and apply RoPE.
-    // q_pe[h] starts at q_b[h * head_dim + qk_nope], length n_rot.
-    // For simplicity, we copy q_pe to a contiguous buffer first.
-    // TODO: could write a fused kernel that extracts + RoPEs in one pass.
+    // Extract q_pe via GPU strided copy, then apply RoPE.
     {
-        float *q_b_cpu = (float *)malloc((uint64_t)n_head * head_dim * sizeof(float));
-        float *q_pe_cpu = (float *)malloc((uint64_t)n_head * n_rot * sizeof(float));
-        if (!q_b_cpu || !q_pe_cpu) { free(q_b_cpu); free(q_pe_cpu); return 0; }
-
-        ds4_metal_tensor_read(mc->q_b_1xHxD, 0, q_b_cpu,
-                              (uint64_t)n_head * head_dim * sizeof(float));
-
-        for (uint32_t h = 0; h < n_head; h++) {
-            memcpy(q_pe_cpu + h * n_rot,
-                   q_b_cpu + h * head_dim + qk_nope,
-                   n_rot * sizeof(float));
-        }
-
-        ds4_metal_tensor_write(mc->q_pe_1xHxR, 0, q_pe_cpu,
-                               (uint64_t)n_head * n_rot * sizeof(float));
-
-        free(q_b_cpu);
-        free(q_pe_cpu);
+        if (!l26f_metal_strided_extract(mc->q_pe_1xHxR, mc->q_b_1xHxD,
+                n_head, n_rot, head_dim, qk_nope))
+            return 0;
     }
 
     // Apply RoPE to q_pe (batched: n_head vectors of n_rot dims each)
@@ -304,20 +286,12 @@ int l26f_mla_layer_gpu(
     // --- Step 7: Split kv_a → kv_cmpr + k_pe, RMS norm kv_cmpr, RoPE k_pe ---
     // kv_a layout: [kv_dim] = first kv_lora_rank=512 floats are kv_cmpr, last n_rot=64 are k_pe
     {
-        float *kv_a_cpu = (float *)malloc(kv_dim * sizeof(float));
-        if (!kv_a_cpu) return 0;
-
-        ds4_metal_tensor_read(mc->kv_a_1xCR, 0, kv_a_cpu, kv_dim * sizeof(float));
-
-        float *kv_cmpr_cpu = kv_a_cpu;
-        float *k_pe_cpu    = kv_a_cpu + kv_lora_rank;
-
-        ds4_metal_tensor_write(mc->kv_cmpr_1xC, 0, kv_cmpr_cpu,
-                               kv_lora_rank * sizeof(float));
-        ds4_metal_tensor_write(mc->k_pe_1xR, 0, k_pe_cpu,
-                               n_rot * sizeof(float));
-
-        free(kv_a_cpu);
+        if (!l26f_metal_strided_extract(mc->kv_cmpr_1xC, mc->kv_a_1xCR,
+                1, kv_lora_rank, kv_dim, 0))
+            return 0;
+        if (!l26f_metal_strided_extract(mc->k_pe_1xR, mc->kv_a_1xCR,
+                1, n_rot, kv_dim, kv_lora_rank))
+            return 0;
     }
 
     if (!ds4_metal_rms_norm_weight_tensor(mc->kv_cmpr_1xC, mc->kv_cmpr_1xC,
@@ -332,33 +306,12 @@ int l26f_mla_layer_gpu(
     // --- Step 8: Absorption ---
     // wk_b layout: [P, C, H] = [128, 512, 32] IQ4_NL
     // For each head h: q_absorbed[h] = wk_b[h] × q_nope[h]
-    // Input: q_nope per head = q_b[h * head_dim ... h * head_dim + qk_nope - 1]
-    // We need contiguous per-head input for the batched kernel.
+    // Extract q_nope via GPU strided copy (reuse v_decomp_HxP as temp buffer).
     {
-        float *q_b_cpu = (float *)malloc((uint64_t)n_head * head_dim * sizeof(float));
-        float *q_nope_cpu = (float *)malloc((uint64_t)n_head * qk_nope * sizeof(float));
-        if (!q_b_cpu || !q_nope_cpu) { free(q_b_cpu); free(q_nope_cpu); return 0; }
+        if (!l26f_metal_strided_extract(mc->v_decomp_HxP, mc->q_b_1xHxD,
+                n_head, qk_nope, head_dim, 0))
+            return 0;
 
-        ds4_metal_tensor_read(mc->q_b_1xHxD, 0, q_b_cpu,
-                              (uint64_t)n_head * head_dim * sizeof(float));
-
-        for (uint32_t h = 0; h < n_head; h++) {
-            memcpy(q_nope_cpu + h * qk_nope,
-                   q_b_cpu + h * head_dim,
-                   qk_nope * sizeof(float));
-        }
-
-        // Write q_nope into a temporary GPU tensor — reuse q_pe_1xHxR buffer
-        // since we've already extracted q_pe. Actually, we need a separate buffer.
-        // Let's reuse v_decomp_HxP as temp (it's n_head * 128 = n_head * qk_nope)
-        ds4_metal_tensor_write(mc->v_decomp_HxP, 0, q_nope_cpu,
-                               (uint64_t)n_head * qk_nope * sizeof(float));
-
-        free(q_b_cpu);
-        free(q_nope_cpu);
-
-        // Compute head_stride for wk_b: [P, C, H] → each head slice is [P, C]
-        // C rows × P cols of IQ4_NL → C * (P/32) * 18 bytes
         const uint64_t head_bytes_k = (uint64_t)t_k_b_PxCxH->dim[1] *
             ((uint64_t)t_k_b_PxCxH->dim[0] / 32) * 18;
 
@@ -374,21 +327,12 @@ int l26f_mla_layer_gpu(
         mla_ckpt_sum(mc->q_absorbed_HxC, (uint64_t)n_head * kv_lora_rank * sizeof(float), "q_absorbed", layer);
     }
 
-    // --- Step 9: KV cache update (CPU) ---
+    // --- Step 9: KV cache update (GPU-side append) ---
     {
-        float kv_cmpr_cpu[512];
-        float k_pe_cpu[64];
-        ds4_metal_tensor_read(mc->kv_cmpr_1xC, 0, kv_cmpr_cpu, kv_lora_rank * sizeof(float));
-        ds4_metal_tensor_read(mc->k_pe_1xR, 0, k_pe_cpu, n_rot * sizeof(float));
-
-        float *k_new = kv_cache->data_TxCR + (uint64_t)kv_cache->n_tokens * kv_dim;
-        memcpy(k_new, kv_cmpr_cpu, kv_lora_rank * sizeof(float));
-        memcpy(k_new + kv_lora_rank, k_pe_cpu, n_rot * sizeof(float));
+        if (!l26f_metal_kv_append(kv_cache->gpu_cache, mc->kv_cmpr_1xC, mc->k_pe_1xR,
+                kv_lora_rank, n_rot, (uint32_t)kv_cache->n_tokens))
+            return 0;
         kv_cache->n_tokens++;
-
-        // Upload entire cache to GPU
-        uint64_t cache_bytes = (uint64_t)kv_cache->n_tokens * kv_dim * sizeof(float);
-        ds4_metal_tensor_write(kv_cache->gpu_cache, 0, kv_cache->data_TxCR, cache_bytes);
     }
 
     // --- Step 10: Attention (MQA) ---

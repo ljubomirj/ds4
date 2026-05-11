@@ -264,3 +264,295 @@ kernel void kernel_l26f_axpy(
         dst[i] += alpha * src[i];
     }
 }
+
+// ---- MoE Expert Router ----
+//
+// Input: router_logits[E] (raw logits from gate_inp matvec)
+// Input: exp_probs_b[E] (bias, may be NULL — pass same as logits to skip)
+// Output: selected_indices[K] (top-8 expert indices)
+// Output: selected_weights[K] (normalized weights, scaled by w_scale=2.5)
+//
+// Algorithm:
+//   1. Add bias to logits
+//   2. Softmax over all E=256 experts
+//   3. Group scoring: 8 groups × 32 experts, score = sum(top-2 probs per group)
+//   4. Select top-4 groups
+//   5. Mask: zero out experts not in top-4 groups
+//   6. Select top-8 from masked pool
+//   7. Normalize weights, scale by w_scale
+//
+// Single-threaded kernel (E=256 is tiny for GPU — one thread is fastest).
+
+typedef struct {
+    int32_t n_expert;
+    int32_t n_groups;
+    int32_t n_exp_per_group;
+    int32_t n_top_groups;
+    int32_t n_selected;
+    float   w_scale;
+    int32_t has_bias;
+} l26f_kargs_moe_route;
+
+kernel void kernel_l26f_moe_route(
+        constant l26f_kargs_moe_route & args  [[buffer(0)]],
+        device const float             * logits [[buffer(1)]],
+        device const float             * bias   [[buffer(2)]],
+        device       int32_t           * sel_idx [[buffer(3)]],
+        device       float             * sel_wt  [[buffer(4)]],
+        uint gid [[thread_position_in_grid]])
+{
+    if (gid > 0) return;
+
+    const int E = args.n_expert;
+    const int G = args.n_groups;
+    const int EPG = args.n_exp_per_group;
+
+    float probs[256];
+    for (int i = 0; i < E; i++) {
+        probs[i] = logits[i];
+        if (args.has_bias) probs[i] += bias[i];
+    }
+
+    float maxv = probs[0];
+    for (int i = 1; i < E; i++) if (probs[i] > maxv) maxv = probs[i];
+    float sum = 0;
+    for (int i = 0; i < E; i++) { probs[i] = exp(probs[i] - maxv); sum += probs[i]; }
+    for (int i = 0; i < E; i++) probs[i] /= sum;
+
+    float group_scores[8];
+    for (int g = 0; g < G; g++) {
+        float t0 = 0, t1 = 0;
+        for (int i = 0; i < EPG; i++) {
+            float p = probs[g * EPG + i];
+            if (p > t0) { t1 = t0; t0 = p; }
+            else if (p > t1) { t1 = p; }
+        }
+        group_scores[g] = t0 + t1;
+    }
+
+    int top_groups[8];
+    for (int i = 0; i < G; i++) top_groups[i] = i;
+    for (int i = 0; i < args.n_top_groups; i++) {
+        int best = i;
+        for (int j = i + 1; j < G; j++) {
+            if (group_scores[top_groups[j]] > group_scores[top_groups[best]])
+                best = j;
+        }
+        int tmp = top_groups[i]; top_groups[i] = top_groups[best]; top_groups[best] = tmp;
+    }
+
+    float masked[256];
+    for (int i = 0; i < E; i++) masked[i] = probs[i];
+    for (int g = 0; g < G; g++) {
+        bool sel = false;
+        for (int i = 0; i < args.n_top_groups; i++)
+            if (top_groups[i] == g) { sel = true; break; }
+        if (!sel) {
+            for (int i = 0; i < EPG; i++)
+                masked[g * EPG + i] = -1e30f;
+        }
+    }
+
+    for (int i = 0; i < args.n_selected; i++) {
+        int best_e = 0;
+        float best_p = -1e30f;
+        for (int e = 0; e < E; e++) {
+            if (masked[e] > best_p) { best_p = masked[e]; best_e = e; }
+        }
+        sel_idx[i] = best_e;
+        sel_wt[i] = probs[best_e];
+        masked[best_e] = -1e30f;
+    }
+
+    float wsum = 0;
+    for (int i = 0; i < args.n_selected; i++) wsum += sel_wt[i];
+    if (wsum > 1e-6f) {
+        for (int i = 0; i < args.n_selected; i++) sel_wt[i] /= wsum;
+    }
+    for (int i = 0; i < args.n_selected; i++) sel_wt[i] *= args.w_scale;
+}
+
+// ---- Fused MoE Expert Matvec (IQ4_NL) ----
+//
+// For each of K=8 selected experts, compute one row of the weight matvec.
+// Layout: grid(K * out_rows, 1, 1), each thread handles one output element.
+//
+// Arguments:
+//   weights:    base pointer to expert weights (from mmap)
+//   input:      [in_dim] float input vector (shared across experts)
+//   output:     [K * out_rows] float output (contiguous per expert)
+//   offsets:    [K] uint64 expert weight offsets
+//   sel_idx:    [K] int32 selected expert indices
+//   expert_row_bytes: [256] uint64 row bytes per expert (for variable types)
+//
+// This kernel allows dispatching all 8 expert matvecs in a single GPU call,
+// eliminating command buffer breaks between experts.
+
+typedef struct {
+    int32_t n_experts;
+    int32_t in_dim;
+    int32_t out_rows;
+    int32_t block_size;
+    int32_t type_size;
+} l26f_kargs_fused_moe_iq4nl;
+
+kernel void kernel_l26f_fused_moe_iq4nl(
+        constant l26f_kargs_fused_moe_iq4nl & args [[buffer(0)]],
+        device const char     * weights     [[buffer(1)]],
+        device const float    * input       [[buffer(2)]],
+        device       float    * output      [[buffer(3)]],
+        device const uint64_t * offsets     [[buffer(4)]],
+        uint gid [[thread_position_in_grid]])
+{
+    const int total = args.n_experts * args.out_rows;
+    if ((int)gid >= total) return;
+
+    const int e = (int)gid / args.out_rows;
+    const int row = (int)gid % args.out_rows;
+
+    device const block_iq4_nl * w = (device const block_iq4_nl *)
+        (weights + offsets[e]);
+    const int n_blocks = args.in_dim / 32;
+    const int row_blocks = args.out_rows * n_blocks;
+
+    float sum = 0.0f;
+    for (int ib = 0; ib < n_blocks; ib++) {
+        device const block_iq4_nl & blk = w[(uint64_t)row * n_blocks + ib];
+        const float d = blk.d;
+        device const uint8_t * qs = blk.qs;
+        for (int j = 0; j < 16; j++) {
+            int base = ib * 32 + j;
+            if (base < args.in_dim)
+                sum += d * kvalues_iq4nl_f[qs[j] & 0xf] * input[base];
+            base = ib * 32 + j + 16;
+            if (base < args.in_dim)
+                sum += d * kvalues_iq4nl_f[qs[j] >> 4] * input[base];
+        }
+    }
+
+    output[(uint64_t)e * args.out_rows + row] = sum;
+}
+
+// ---- Fused MoE Expert Matvec (Q5_K) ----
+// Same structure as IQ4_NL version but uses Q5_K dequantization.
+
+typedef struct {
+    int32_t n_experts;
+    int32_t in_dim;
+    int32_t out_rows;
+} l26f_kargs_fused_moe_q5k;
+
+kernel void kernel_l26f_fused_moe_q5k(
+        constant l26f_kargs_fused_moe_q5k & args [[buffer(0)]],
+        device const char     * weights     [[buffer(1)]],
+        device const float    * input       [[buffer(2)]],
+        device       float    * output      [[buffer(3)]],
+        device const uint64_t * offsets     [[buffer(4)]],
+        uint gid [[thread_position_in_grid]])
+{
+    const int total = args.n_experts * args.out_rows;
+    if ((int)gid >= total) return;
+
+    const int e = (int)gid / args.out_rows;
+    const int row = (int)gid % args.out_rows;
+
+    device const block_q5_K * blocks = (device const block_q5_K *)
+        (weights + offsets[e]) + (uint64_t)row * (args.in_dim / 256);
+
+    float sum = 0.0f;
+    for (int ib = 0; ib < args.in_dim / 256; ib++) {
+        for (short il = 0; il < 16; il++) {
+            float4x4 reg;
+            dequantize_q5_K(&blocks[ib], il, reg);
+            int base = ib * 256 + il * 16;
+            for (int j = 0; j < 4; j++) {
+                for (int k = 0; k < 4; k++) {
+                    int idx = base + j * 4 + k;
+                    if (idx < args.in_dim)
+                        sum += reg[j][k] * input[idx];
+                }
+            }
+        }
+    }
+
+    output[(uint64_t)e * args.out_rows + row] = sum;
+}
+
+// ---- Fused MoE SwiGLU + Accumulate ----
+//
+// For each of K=8 experts:
+//   mid[e][j] = gate[e][j] * sigmoid(gate[e][j]) * up[e][j]
+// Then accumulate weighted experts:
+//   out[j] += weight[e] * mid[e][j]
+//
+// But we also need the down matvec between swiglu and accumulate.
+// So this kernel just does the swiglu part, storing mid[e] contiguously.
+
+typedef struct {
+    int32_t n_experts;
+    int32_t n_elements;
+} l26f_kargs_fused_swiglu;
+
+kernel void kernel_l26f_fused_swiglu(
+        constant l26f_kargs_fused_swiglu & args [[buffer(0)]],
+        device const float * gate   [[buffer(1)]],
+        device const float * up     [[buffer(2)]],
+        device       float * mid    [[buffer(3)]],
+        uint gid [[thread_position_in_grid]])
+{
+    const int total = args.n_experts * args.n_elements;
+    if ((int)gid >= total) return;
+
+    const int e = (int)gid / args.n_elements;
+    const int j = (int)gid % args.n_elements;
+
+    float g = gate[(uint64_t)e * args.n_elements + j];
+    float u = up[(uint64_t)e * args.n_elements + j];
+    float sig = 1.0f / (1.0f + exp(-g));
+    mid[(uint64_t)e * args.n_elements + j] = g * sig * u;
+}
+
+// ---- Fused MoE Down + Weighted Accumulate ----
+//
+// After down matvec produces down_out[e][j], accumulate:
+//   moe_out[j] = sum_e(weight[e] * down_out[e][j]) + shared_expert[j]
+//
+// We combine the accumulate with the shared expert addition.
+
+typedef struct {
+    int32_t n_experts;
+    int32_t n_elements;
+} l26f_kargs_fused_accum;
+
+kernel void kernel_l26f_fused_accum(
+        constant l26f_kargs_fused_accum & args [[buffer(0)]],
+        device const float    * expert_out  [[buffer(1)]],
+        device const float    * weights     [[buffer(2)]],
+        device const float    * shared_out  [[buffer(3)]],
+        device       float    * moe_out     [[buffer(4)]],
+        uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= args.n_elements) return;
+
+    float sum = shared_out[gid];
+    for (int e = 0; e < args.n_experts; e++) {
+        sum += weights[e] * expert_out[(uint64_t)e * args.n_elements + gid];
+    }
+    moe_out[gid] = sum;
+}
+
+// ---- Gather Expert Offsets ----
+//
+// Read K selected expert indices, look up offsets from a 256-entry table,
+// write K offsets to output buffer. Runs with K threads.
+
+kernel void kernel_l26f_gather_offsets(
+        device const int32_t   * sel_idx   [[buffer(0)]],
+        device const uint64_t  * all_off   [[buffer(1)]],
+        device       uint64_t  * out_off   [[buffer(2)]],
+        constant     int32_t   & K         [[buffer(3)]],
+        uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= K) return;
+    out_off[gid] = all_off[sel_idx[gid]];
+}

@@ -168,4 +168,90 @@ int l26f_metal_axpy(
     float                   alpha,
     uint32_t                n);
 
+// Strided extract: extract n_vectors slices of slice_len from src with stride src_stride
+// dst[v * slice_len + j] = src[v * src_stride + src_offset + j]
+int l26f_metal_strided_extract(
+    ds4_metal_tensor       *dst,
+    const ds4_metal_tensor *src,
+    uint32_t                n_vectors,
+    uint32_t                slice_len,
+    uint32_t                src_stride,
+    uint32_t                src_offset);
+
+// KV cache append: append kv_cmpr[C] + k_pe[R] to cache at position n_cached
+int l26f_metal_kv_append(
+    ds4_metal_tensor       *cache,
+    const ds4_metal_tensor *kv_cmpr,
+    const ds4_metal_tensor *k_pe,
+    uint32_t                kv_lora_rank,
+    uint32_t                n_rot,
+    uint32_t                n_cached);
+
+// MoE expert routing: softmax + group scoring + top-8 selection on GPU
+int l26f_metal_moe_route(
+    ds4_metal_tensor       *router_logits,
+    const void             *model_map,
+    uint64_t                model_size,
+    uint64_t                bias_offset,
+    int32_t                 has_bias,
+    ds4_metal_tensor       *selected_indices,
+    ds4_metal_tensor       *selected_weights,
+    uint32_t                n_expert,
+    uint32_t                n_groups,
+    uint32_t                n_exp_per_group,
+    uint32_t                n_top_groups,
+    uint32_t                n_selected,
+    float                   w_scale);
+
+// Fused MoE expert matvec (IQ4_NL): all K experts in one dispatch
+// offsets: [K] uint64 expert weight offsets (GPU buffer)
+int l26f_metal_fused_moe_iq4nl(
+    ds4_metal_tensor       *dst,
+    const void             *model_map,
+    uint64_t                model_size,
+    const ds4_metal_tensor *offsets,
+    uint64_t                weight_base,
+    uint64_t                total_expert_bytes,
+    uint32_t                n_experts,
+    uint32_t                in_dim,
+    uint32_t                out_rows,
+    const ds4_metal_tensor *input);
+
+// Fused MoE expert matvec (Q5_K): all K experts in one dispatch
+int l26f_metal_fused_moe_q5k(
+    ds4_metal_tensor       *dst,
+    const void             *model_map,
+    uint64_t                model_size,
+    const ds4_metal_tensor *offsets,
+    uint64_t                weight_base,
+    uint64_t                total_expert_bytes,
+    uint32_t                n_experts,
+    uint32_t                in_dim,
+    uint32_t                out_rows,
+    const ds4_metal_tensor *input);
+
+// Fused swiglu: mid[e] = gate[e] * sigmoid(gate[e]) * up[e] for K experts
+int l26f_metal_fused_swiglu(
+    ds4_metal_tensor       *mid,
+    const ds4_metal_tensor *gate,
+    const ds4_metal_tensor *up,
+    uint32_t                n_experts,
+    uint32_t                n_elements);
+
+// Fused accumulate: moe_out[j] = sum_e(weight[e] * down_out[e][j]) + shared[j]
+int l26f_metal_fused_accum(
+    ds4_metal_tensor       *moe_out,
+    const ds4_metal_tensor *expert_down,
+    const ds4_metal_tensor *weights,
+    const ds4_metal_tensor *shared_out,
+    uint32_t                n_experts,
+    uint32_t                n_elements);
+
+// Gather expert offsets: map K selected indices to K weight offsets
+int l26f_metal_gather_offsets(
+    ds4_metal_tensor       *sel_idx,
+    const ds4_metal_tensor *all_offsets,
+    ds4_metal_tensor       *out_offsets,
+    uint32_t                K);
+
 #endif
