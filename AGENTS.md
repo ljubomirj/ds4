@@ -133,9 +133,84 @@ See `docs/14-code-style.md` for XLOG macro definition and conventions.
 ## Build
 
 ```sh
-cd contrib/l26f
+cd worktrees/l26f   # or just `make` if already in the worktree
 make clean && make test_l26f_multilayer
 ```
 
 No external libraries needed. No llama.cpp linking. Everything in this directory.
 Metal framework required (macOS only).
+
+---
+
+## Git / GitHub Repository Setup
+
+### Remotes
+
+| Remote | URL | Direction |
+|--------|-----|-----------|
+| `origin` | `https://github.com/ljubomirj/l26f.git` | Public fork (you) |
+| `upstream` | `https://github.com/antirez/ds4` | Original project |
+
+`origin` is **your** public repo. `upstream` is antirez's ds4.
+
+### Worktrees
+
+This directory (`worktrees/l26f/`) is a **git worktree** of the ds4 repo at
+`../..` (i.e. `~/llama.cpp/contrib/ds4/`). Three worktrees exist:
+
+| Worktree path | Branch | Tracks | Purpose |
+|---|---|---|---|
+| `~/llama.cpp/contrib/ds4` (main repo) | `main` | `origin/main` | Pinned at the commit where `l26f` was branched (d615ab0). Preserved for reference. |
+| `.../worktrees/l26f` | `l26f` | `origin/l26f` | **Your working branch.** All development happens here. |
+| `.../worktrees/ds4-main` | `ds4-main` | `upstream/main` | Latest upstream HEAD. Updated via `git pull` to track antirez's changes. |
+
+### Push Safety: Only `l26f` Goes to Origin
+
+The `origin` remote is **locked** to only ever push the `l26f` branch:
+
+```ini
+[remote "origin"]
+	push = refs/heads/l26f:refs/heads/l26f
+```
+
+This means from **any** worktree or branch, `git push origin` (no refspec) will
+only push `l26f`. An explicit `git push origin main:main` would still work, but
+you'd have to type it deliberately. The configured refspec prevents accidental
+pushes via bare `git push`, `git push --all`, or `git push origin` from the wrong
+worktree.
+
+### Daily Workflow
+
+```sh
+# Work in the l26f worktree
+cd ~/llama.cpp/contrib/ds4/worktrees/l26f
+
+# Make changes, commit, push
+git add -A
+git commit -m "some message"
+git push origin
+
+# To see upstream changes without touching your work:
+cd ~/llama.cpp/contrib/ds4/worktrees/ds4-main
+git pull
+
+# View all worktrees from anywhere:
+git worktree list
+```
+
+### Why This Setup
+
+- The `main` branch in the main repo is **frozen** at the ds4 revision from which
+  `l26f` was forked. This preserves the baseline context.
+- The `ds4-main` worktree tracks the latest upstream for comparison, merging,
+  or rebasing.
+- The push refspec is a **safety net**: even a fat-fingered `git push --all` or
+  `git push origin` from the wrong worktree can't overwrite `main` on your
+  public GitHub.
+
+### Adding the Upstream Remote (if setting up fresh)
+
+```sh
+git remote add upstream https://github.com/antirez/ds4.git
+git fetch upstream
+```
