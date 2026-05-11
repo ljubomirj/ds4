@@ -215,7 +215,8 @@ int l26f_metal_fused_moe_iq4nl(
     uint32_t                n_experts,
     uint32_t                in_dim,
     uint32_t                out_rows,
-    const ds4_metal_tensor *input);
+    const ds4_metal_tensor *input,
+    int                     per_expert_input);
 
 // Fused MoE expert matvec (Q5_K): all K experts in one dispatch
 int l26f_metal_fused_moe_q5k(

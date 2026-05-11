@@ -394,6 +394,7 @@ typedef struct {
     int32_t out_rows;
     int32_t block_size;
     int32_t type_size;
+    int32_t per_expert_input;
 } l26f_kargs_fused_moe_iq4nl;
 
 kernel void kernel_l26f_fused_moe_iq4nl(
@@ -402,35 +403,83 @@ kernel void kernel_l26f_fused_moe_iq4nl(
         device const float    * input       [[buffer(2)]],
         device       float    * output      [[buffer(3)]],
         device const uint64_t * offsets     [[buffer(4)]],
-        uint gid [[thread_position_in_grid]])
+        threadgroup float     * shmem       [[threadgroup(0)]],
+        uint2  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]])
 {
-    const int total = args.n_experts * args.out_rows;
-    if ((int)gid >= total) return;
+    (void)sgitg;
+    const int NR0 = 2;
+    const int e = (int)tgpig.y;
+    if (e >= args.n_experts) return;
 
-    const int e = (int)gid / args.out_rows;
-    const int row = (int)gid % args.out_rows;
+    const int n_blocks = args.in_dim / 32;
+    const int first_row = (int)tgpig.x * NR0;
 
     device const block_iq4_nl * w = (device const block_iq4_nl *)
         (weights + offsets[e]);
-    const int n_blocks = args.in_dim / 32;
-    const int row_blocks = args.out_rows * n_blocks;
+    const uint64_t in_off = args.per_expert_input ? (uint64_t)e * args.in_dim : 0;
+    device const float * y = input + in_off;
 
-    float sum = 0.0f;
-    for (int ib = 0; ib < n_blocks; ib++) {
-        device const block_iq4_nl & blk = w[(uint64_t)row * n_blocks + ib];
-        const float d = blk.d;
-        device const uint8_t * qs = blk.qs;
-        for (int j = 0; j < 16; j++) {
-            int base = ib * 32 + j;
-            if (base < args.in_dim)
-                sum += d * kvalues_iq4nl_f[qs[j] & 0xf] * input[base];
-            base = ib * 32 + j + 16;
-            if (base < args.in_dim)
-                sum += d * kvalues_iq4nl_f[qs[j] >> 4] * input[base];
+    const short ix = tiisg / 2;
+    const short it = tiisg % 2;
+
+    shmem[tiisg] = kvalues_iq4nl_f[tiisg % 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 yl[4];
+    float sumf[2] = {0.f};
+
+    device const float * yb = y + ix * 32 + it * 8;
+
+    uint32_t aux32[2];
+    thread const uint8_t * q8 = (thread const uint8_t *)aux32;
+
+    float4 qf1, qf2;
+
+    for (int ib = ix; ib < n_blocks; ib += 16) {
+        device const float4 * y4 = (device const float4 *)yb;
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        for (short row = 0; row < NR0; row++) {
+            if (first_row + row >= args.out_rows) break;
+            device const block_iq4_nl & xb = w[(uint64_t)(first_row + row) * n_blocks + ib];
+            device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8*it);
+
+            float4 acc1 = {0.f}, acc2 = {0.f};
+
+            aux32[0] = q4[0] | (q4[1] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+            aux32[0] &= 0x0f0f0f0f;
+            qf1 = {shmem[q8[0]], shmem[q8[1]], shmem[q8[2]], shmem[q8[3]]};
+            qf2 = {shmem[q8[4]], shmem[q8[5]], shmem[q8[6]], shmem[q8[7]]};
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = q4[2] | (q4[3] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+            aux32[0] &= 0x0f0f0f0f;
+            qf1 = {shmem[q8[0]], shmem[q8[1]], shmem[q8[2]], shmem[q8[3]]};
+            qf2 = {shmem[q8[4]], shmem[q8[5]], shmem[q8[6]], shmem[q8[7]]};
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+            sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
         }
+
+        yb += 16 * 32;
     }
 
-    output[(uint64_t)e * args.out_rows + row] = sum;
+    for (int row = 0; row < NR0 && first_row + row < args.out_rows; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            output[(uint64_t)e * args.out_rows + first_row + row] = sum_all;
+        }
+    }
 }
 
 // ---- Fused MoE Expert Matvec (Q5_K) ----
@@ -469,7 +518,7 @@ kernel void kernel_l26f_fused_moe_q5k(
                 for (int k = 0; k < 4; k++) {
                     int idx = base + j * 4 + k;
                     if (idx < args.in_dim)
-                        sum += reg[j][k] * input[idx];
+                        sum += reg[j][k] * input[(uint64_t)e * args.in_dim + idx];
                 }
             }
         }

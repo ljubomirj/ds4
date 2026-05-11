@@ -15383,7 +15383,8 @@ int l26f_metal_fused_moe_iq4nl(
     uint32_t                n_experts,
     uint32_t                in_dim,
     uint32_t                out_rows,
-    const ds4_metal_tensor *input)
+    const ds4_metal_tensor *input,
+    int                     per_expert_input)
 {
     if (!g_initialized && !ds4_metal_init()) return 0;
 
@@ -15407,15 +15408,15 @@ int l26f_metal_fused_moe_iq4nl(
             int32_t out_rows;
             int32_t block_size;
             int32_t type_size;
-        } args = { (int32_t)n_experts, (int32_t)in_dim, (int32_t)out_rows, 32, 18 };
+            int32_t per_expert_input;
+        } args = { (int32_t)n_experts, (int32_t)in_dim, (int32_t)out_rows, 32, 18, per_expert_input };
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
         if (!cb) return 0;
 
-        NSUInteger nth = [pipeline maxTotalThreadsPerThreadgroup];
-        NSUInteger total = (NSUInteger)n_experts * out_rows;
-        if (nth > total) nth = total;
+        const int NR0 = 2;
+        NSUInteger tg_rows = (out_rows + NR0 - 1) / NR0;
 
         id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
@@ -15424,8 +15425,8 @@ int l26f_metal_fused_moe_iq4nl(
         [enc setBuffer:inbuf offset:ds4_metal_tensor_offset(input) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_metal_tensor_offset(dst) atIndex:3];
         [enc setBuffer:offbuf offset:ds4_metal_tensor_offset(offsets) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(nth ? nth : 1, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(tg_rows, n_experts, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_metal_end_compute_encoder(cb, enc);
 
         return ds4_metal_finish_command_buffer(cb, owned, "l26f_fused_moe_iq4nl");

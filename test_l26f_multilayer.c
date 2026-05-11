@@ -121,6 +121,156 @@ static l26f_tensor *l26f_layer_tensor(const l26f_model *m, uint32_t layer, const
     return l26f_model_find_tensor(m, name);
 }
 
+// =========================================================================
+// L26F_DBG: Debug checkpoint infrastructure for fused MoE NaN investigation
+// =========================================================================
+// Enable with: -DL26F_DBG_FUSED
+// Compare mode: -DL26F_DBG_COMPARE (implies L26F_DBG_FUSED)
+// Control which layer to debug: env L26F_DBG_LAYER=N (default: layer 1)
+// Control per-stage breaks: env L26F_DBG_BREAKS=1 (default: 1, set 0 for no-break test)
+
+#ifdef L26F_DBG_COMPARE
+#define L26F_DBG_FUSED
+#endif
+
+#ifdef L26F_DBG_FUSED
+
+typedef enum {
+    L26F_DBG_VAL_OK,
+    L26F_DBG_VAL_LARGE,
+    L26F_DBG_VAL_POS_INF,
+    L26F_DBG_VAL_NEG_INF,
+    L26F_DBG_VAL_NAN,
+    L26F_DBG_VAL_ZERO
+} l26f_dbg_val_class;
+
+static l26f_dbg_val_class L26F_DBG_CLASSIFY(float v, float threshold) {
+    if (isnan(v))                    return L26F_DBG_VAL_NAN;
+    if (isinf(v) && v > 0)           return L26F_DBG_VAL_POS_INF;
+    if (isinf(v) && v < 0)           return L26F_DBG_VAL_NEG_INF;
+    if (v == 0.0f)                    return L26F_DBG_VAL_ZERO;
+    if (fabsf(v) > threshold)         return L26F_DBG_VAL_LARGE;
+    return L26F_DBG_VAL_OK;
+}
+
+static void L26F_DBG_CHECKPOINT_IMPL(
+        const char *label,
+        const ds4_metal_tensor *t, uint64_t nfloats,
+        const char *file, int line)
+{
+    float insane_threshold = 1e4f;
+    uint64_t bytes = nfloats * sizeof(float);
+    float *data = (float *)malloc(bytes);
+    if (!data) { fprintf(stderr, "DBG OOM %s\n", label); return; }
+
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read((ds4_metal_tensor *)t, 0, data, bytes);
+
+    int n_ok = 0, n_nan = 0, n_pinf = 0, n_ninf = 0, n_large = 0, n_zero = 0;
+    float sum = 0.0f, max_abs = 0.0f, min_val = 1e30f, max_val = -1e30f;
+    int first_bad_idx = -1;
+    l26f_dbg_val_class first_bad_class = L26F_DBG_VAL_OK;
+
+    for (uint64_t i = 0; i < nfloats; i++) {
+        l26f_dbg_val_class c = L26F_DBG_CLASSIFY(data[i], insane_threshold);
+        switch (c) {
+            case L26F_DBG_VAL_OK:      n_ok++;    sum += data[i]; break;
+            case L26F_DBG_VAL_NAN:     n_nan++;   break;
+            case L26F_DBG_VAL_POS_INF: n_pinf++;  break;
+            case L26F_DBG_VAL_NEG_INF: n_ninf++;  break;
+            case L26F_DBG_VAL_LARGE:   n_large++; sum += data[i]; break;
+            case L26F_DBG_VAL_ZERO:    n_zero++;  break;
+        }
+        float a = fabsf(data[i]);
+        if (a > max_abs) max_abs = a;
+        if (data[i] == data[i]) { // not NaN
+            if (data[i] < min_val) min_val = data[i];
+            if (data[i] > max_val) max_val = data[i];
+        }
+        if (first_bad_idx < 0 && c != L26F_DBG_VAL_OK && c != L26F_DBG_VAL_ZERO) {
+            first_bad_idx = (int)i;
+            first_bad_class = c;
+        }
+    }
+
+    fprintf(stderr, "DBG %s:%d %-30s n=%llu ok=%d nan=%d +inf=%d -inf=%d large=%d zero=%d sum=%.4f max_abs=%.4f range=[%.4f,%.4f]",
+            file, line, label, (unsigned long long)nfloats,
+            n_ok, n_nan, n_pinf, n_ninf, n_large, n_zero, sum, max_abs, min_val, max_val);
+    if (first_bad_idx >= 0) {
+        fprintf(stderr, " FIRST_BAD=[%d]=%f(cls=%d)", first_bad_idx,
+                data[first_bad_idx], (int)first_bad_class);
+    }
+    fprintf(stderr, "\n");
+    free(data);
+    ds4_metal_begin_commands();
+}
+
+#define L26F_DBG_CHECKPOINT(LABEL, TENSOR, NFLOATS) \
+    L26F_DBG_CHECKPOINT_IMPL((LABEL), (TENSOR), (NFLOATS), __FILE__, __LINE__)
+
+static void L26F_DBG_ASSERT_EQ_IMPL(
+        const char *label,
+        const float *a, const float *b, uint64_t n,
+        const char *file, int line)
+{
+    float max_diff = 0.0f;
+    float tol = 1e-3f;
+    int first_diff_idx = -1;
+    int n_diff = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        if (d > max_diff) max_diff = d;
+        if (d > tol) {
+            n_diff++;
+            if (first_diff_idx < 0) first_diff_idx = (int)i;
+        }
+    }
+    if (max_diff > tol) {
+        fprintf(stderr, "DBG DIFF %s:%d %-30s MAX_DIFF=%.6f n_diff=%d first=[%d] a=%.6f b=%.6f\n",
+                file, line, label, max_diff, n_diff, first_diff_idx,
+                first_diff_idx >= 0 ? a[first_diff_idx] : 0.0f,
+                first_diff_idx >= 0 ? b[first_diff_idx] : 0.0f);
+    } else {
+        fprintf(stderr, "DBG MATCH %s:%d %-30s max_diff=%.6f OK\n",
+                file, line, label, max_diff);
+    }
+}
+
+#define L26F_DBG_ASSERT_EQ(LABEL, A, B, N) \
+    L26F_DBG_ASSERT_EQ_IMPL((LABEL), (A), (B), (N), __FILE__, __LINE__)
+
+static int l26f_dbg_get_layer(void) {
+    static int initialized = 0;
+    static int layer = 1;
+    if (!initialized) {
+        const char *env = getenv("L26F_DBG_LAYER");
+        if (env) layer = atoi(env);
+        if (layer < 1) layer = 1;
+        if (layer > 31) layer = 31;
+        initialized = 1;
+    }
+    return layer;
+}
+
+static int l26f_dbg_get_breaks(void) {
+    static int initialized = 0;
+    static int breaks = 1;
+    if (!initialized) {
+        const char *env = getenv("L26F_DBG_BREAKS");
+        if (env) breaks = atoi(env);
+        initialized = 1;
+    }
+    return breaks;
+}
+
+static void L26F_DBG_READ(const ds4_metal_tensor *t, float *dst, uint64_t nfloats) {
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read((ds4_metal_tensor *)t, 0, dst, nfloats * sizeof(float));
+    ds4_metal_begin_commands();
+}
+
+#endif // L26F_DBG_FUSED
+
 static int l26f_gla_layer(
         l26f_session *s, uint32_t layer,
         ds4_metal_tensor *inp, ds4_metal_tensor *out) {
@@ -376,6 +526,571 @@ static int l26f_moe_ffn(
 
     return 1;
 }
+
+// ---- Production Fused MoE (no breaks, no CPU readback) ----
+//
+// Runs the entire MoE on GPU: routing → gather offsets → fused matvecs →
+// swiglu → accumulate + shared expert. Zero command buffer breaks.
+// Enable with: env L26F_FUSED_MOE=1
+
+static int l26f_use_fused_moe(void) {
+    static int initialized = 0;
+    static int use_fused = 0;
+    if (!initialized) {
+        use_fused = getenv("L26F_FUSED_MOE") != NULL;
+        initialized = 1;
+    }
+    return use_fused;
+}
+
+static int l26f_moe_ffn_fused_prod(
+        l26f_session *s, uint32_t layer,
+        ds4_metal_tensor *inp, ds4_metal_tensor *out) {
+    l26f_model *m = s->model;
+    l26f_compute *c = &s->comp;
+    const uint32_t n_embd = m->n_embd;
+    const uint32_t n_ff_exp = 1024;
+    const uint32_t n_expert = 256;
+    const uint32_t n_groups = 8;
+    const uint32_t n_exp_per_group = n_expert / n_groups;
+    const float w_scale = 2.5f;
+    const int K = 8;
+
+    l26f_tensor *wt_norm_N          = l26f_layer_tensor(m, layer, "ffn_norm.weight");
+    l26f_tensor *wt_gate_inp_NxE    = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
+    l26f_tensor *wt_exp_b_1xE       = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
+    l26f_tensor *wt_gate_exps_NxMxE = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
+    l26f_tensor *wt_up_exps_NxMxE   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
+    l26f_tensor *wt_down_exps_MxNxE = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
+    l26f_tensor *wt_gate_sh_NxM     = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
+    l26f_tensor *wt_up_sh_NxM       = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
+    l26f_tensor *wt_down_sh_MxN     = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
+    if (!wt_norm_N || !wt_gate_inp_NxE || !wt_gate_exps_NxMxE || !wt_up_exps_NxMxE ||
+        !wt_down_exps_MxNxE || !wt_gate_sh_NxM || !wt_up_sh_NxM || !wt_down_sh_MxN) {
+        fprintf(stderr, "l26f: layer %u missing MoE tensors\n", layer);
+        return 0;
+    }
+
+    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed_1xN, inp,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
+        return 0;
+
+    if (!ds4_metal_matmul_f32_tensor(c->router_logits_1xE, m->map, m->size,
+            wt_gate_inp_NxE->abs_offset, n_embd, n_expert, c->ffn_normed_1xN, 1))
+        return 0;
+
+    int32_t has_bias = (wt_exp_b_1xE != NULL) ? 1 : 0;
+    uint64_t bias_off = has_bias ? wt_exp_b_1xE->abs_offset : 0;
+    if (!l26f_metal_moe_route(c->router_logits_1xE, m->map, m->size,
+            bias_off, has_bias,
+            c->moe_sel_idx_K, c->moe_sel_wt_K,
+            n_expert, n_groups, n_exp_per_group, 4, K, w_scale))
+        return 0;
+
+    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_gate_all_off[layer],
+            c->moe_gate_off_K, K))
+        return 0;
+    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_up_all_off[layer],
+            c->moe_up_off_K, K))
+        return 0;
+    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_down_all_off[layer],
+            c->moe_down_off_K, K))
+        return 0;
+
+    const uint32_t gate_bs = l26f_types[wt_gate_exps_NxMxE->type].block_size;
+    const uint32_t gate_ts = l26f_types[wt_gate_exps_NxMxE->type].type_size;
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps_NxMxE->dim[1] * ((uint64_t)wt_gate_exps_NxMxE->dim[0] / gate_bs) * gate_ts;
+    const uint64_t gate_total = (uint64_t)n_expert * gate_exp_bytes;
+
+    const uint32_t up_bs = l26f_types[wt_up_exps_NxMxE->type].block_size;
+    const uint32_t up_ts = l26f_types[wt_up_exps_NxMxE->type].type_size;
+    const uint64_t up_exp_bytes = (uint64_t)wt_up_exps_NxMxE->dim[1] * ((uint64_t)wt_up_exps_NxMxE->dim[0] / up_bs) * up_ts;
+    const uint64_t up_total = (uint64_t)n_expert * up_exp_bytes;
+
+    const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
+    const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * ((uint64_t)wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
+    const uint64_t down_total = (uint64_t)n_expert * down_exp_bytes;
+
+    if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_gate_8xM,
+            m->map, m->size, c->moe_gate_off_K,
+            wt_gate_exps_NxMxE->abs_offset, gate_total,
+            K, n_embd, n_ff_exp, c->ffn_normed_1xN, 0))
+        return 0;
+
+    if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_up_8xM,
+            m->map, m->size, c->moe_up_off_K,
+            wt_up_exps_NxMxE->abs_offset, up_total,
+            K, n_embd, n_ff_exp, c->ffn_normed_1xN, 0))
+        return 0;
+
+    if (!l26f_metal_fused_swiglu(c->moe_expert_mid_8xM,
+            c->moe_expert_gate_8xM, c->moe_expert_up_8xM,
+            K, n_ff_exp))
+        return 0;
+
+    if (wt_down_exps_MxNxE->type == 13) {
+        if (!l26f_metal_fused_moe_q5k(c->moe_expert_down_8xN,
+                m->map, m->size, c->moe_down_off_K,
+                wt_down_exps_MxNxE->abs_offset, down_total,
+                K, n_ff_exp, n_embd, c->moe_expert_mid_8xM))
+            return 0;
+    } else {
+        if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_down_8xN,
+                m->map, m->size, c->moe_down_off_K,
+                wt_down_exps_MxNxE->abs_offset, down_total,
+                K, n_ff_exp, n_embd, c->moe_expert_mid_8xM, 1))
+            return 0;
+    }
+
+    if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_gate_sh_NxM->abs_offset,
+            wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1], wt_gate_sh_NxM->type, 1))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_up_sh_NxM->abs_offset,
+            wt_up_sh_NxM->dim[0], wt_up_sh_NxM->dim[1], wt_up_sh_NxM->type, 1))
+        return 0;
+    if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff_exp, 0.0f, 1.0f))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->shexp_out_1xN, c->ffn_mid_1xF,
+            m->map, m->size, wt_down_sh_MxN->abs_offset,
+            wt_down_sh_MxN->dim[0], wt_down_sh_MxN->dim[1], wt_down_sh_MxN->type, 1))
+        return 0;
+
+    if (!l26f_metal_fused_accum(c->moe_out_1xN,
+            c->moe_expert_down_8xN, c->moe_sel_wt_K, c->shexp_out_1xN,
+            K, n_embd))
+        return 0;
+
+    if (!ds4_metal_add_tensor(out, inp, c->moe_out_1xN, n_embd))
+        return 0;
+
+    return 1;
+}
+
+// =========================================================================
+// L26F_DBG: Fused MoE path for NaN debugging
+// =========================================================================
+// Runs the fused kernel path with optional per-stage breaks and checkpoints.
+// When L26F_DBG_COMPARE is defined, also runs the per-expert path and compares.
+// Enable: -DL26F_DBG_FUSED (fused only) or -DL26F_DBG_COMPARE (both paths)
+
+#ifdef L26F_DBG_FUSED
+
+static int l26f_moe_ffn_fused(
+        l26f_session *s, uint32_t layer,
+        ds4_metal_tensor *inp, ds4_metal_tensor *out) {
+    l26f_model *m = s->model;
+    l26f_compute *c = &s->comp;
+    const uint32_t n_embd = m->n_embd;
+    const uint32_t n_ff_exp = 1024;
+    const uint32_t n_expert = 256;
+    const uint32_t n_groups = 8;
+    const uint32_t n_exp_per_group = n_expert / n_groups;
+    const float w_scale = 2.5f;
+    const int K = 8;
+    const int dbg_breaks = l26f_dbg_get_breaks();
+
+    l26f_tensor *wt_norm_N          = l26f_layer_tensor(m, layer, "ffn_norm.weight");
+    l26f_tensor *wt_gate_inp_NxE    = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
+    l26f_tensor *wt_exp_b_1xE       = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
+    l26f_tensor *wt_gate_exps_NxMxE = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
+    l26f_tensor *wt_up_exps_NxMxE   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
+    l26f_tensor *wt_down_exps_MxNxE = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
+    l26f_tensor *wt_gate_sh_NxM     = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
+    l26f_tensor *wt_up_sh_NxM       = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
+    l26f_tensor *wt_down_sh_MxN     = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
+
+    // 1. RMS norm
+    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed_1xN, inp,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
+        return 0;
+    L26F_DBG_CHECKPOINT("fused_rms_norm", c->ffn_normed_1xN, n_embd);
+
+    // 2. Router matvec + routing
+    if (!ds4_metal_matmul_f32_tensor(c->router_logits_1xE, m->map, m->size,
+            wt_gate_inp_NxE->abs_offset, n_embd, n_expert, c->ffn_normed_1xN, 1))
+        return 0;
+
+    int32_t has_bias = (wt_exp_b_1xE != NULL) ? 1 : 0;
+    uint64_t bias_off = has_bias ? wt_exp_b_1xE->abs_offset : 0;
+    if (!l26f_metal_moe_route(c->router_logits_1xE, m->map, m->size,
+            bias_off, has_bias,
+            c->moe_sel_idx_K, c->moe_sel_wt_K,
+            n_expert, n_groups, n_exp_per_group, 4, K, w_scale))
+        return 0;
+
+    // Read back selected indices + weights (needed for per-expert comparison
+    // and for gather_offsets validation)
+    int32_t selected_experts_K[8];
+    float selected_weights_K[8];
+    L26F_DBG_READ(c->moe_sel_idx_K, (float *)selected_experts_K, 8);
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read(c->moe_sel_wt_K, 0, selected_weights_K, K * sizeof(float));
+    ds4_metal_begin_commands();
+
+    fprintf(stderr, "DBG fused selected experts: ");
+    for (int i = 0; i < K; i++)
+        fprintf(stderr, "%d(%.4f)%s", selected_experts_K[i], selected_weights_K[i],
+                i < K-1 ? " " : "\n");
+
+    // 3. Gather expert weight offsets
+    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_gate_all_off[layer],
+            c->moe_gate_off_K, K))
+        return 0;
+    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_up_all_off[layer],
+            c->moe_up_off_K, K))
+        return 0;
+    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_down_all_off[layer],
+            c->moe_down_off_K, K))
+        return 0;
+
+    if (dbg_breaks) {
+        L26F_DBG_CHECKPOINT("fused_gate_off", c->moe_gate_off_K, K);
+        L26F_DBG_CHECKPOINT("fused_up_off", c->moe_up_off_K, K);
+        L26F_DBG_CHECKPOINT("fused_down_off", c->moe_down_off_K, K);
+    }
+
+    // Compute total tensor sizes for wrap_model_range
+    const uint32_t gate_bs = l26f_types[wt_gate_exps_NxMxE->type].block_size;
+    const uint32_t gate_ts = l26f_types[wt_gate_exps_NxMxE->type].type_size;
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps_NxMxE->dim[1] * ((uint64_t)wt_gate_exps_NxMxE->dim[0] / gate_bs) * gate_ts;
+    const uint64_t gate_total = (uint64_t)n_expert * gate_exp_bytes;
+
+    const uint32_t up_bs = l26f_types[wt_up_exps_NxMxE->type].block_size;
+    const uint32_t up_ts = l26f_types[wt_up_exps_NxMxE->type].type_size;
+    const uint64_t up_exp_bytes = (uint64_t)wt_up_exps_NxMxE->dim[1] * ((uint64_t)wt_up_exps_NxMxE->dim[0] / up_bs) * up_ts;
+    const uint64_t up_total = (uint64_t)n_expert * up_exp_bytes;
+
+    const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
+    const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * ((uint64_t)wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
+    const uint64_t down_total = (uint64_t)n_expert * down_exp_bytes;
+
+    // 4. Fused gate matvec (8 experts × 1024 outputs)
+    if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_gate_8xM,
+            m->map, m->size, c->moe_gate_off_K,
+            wt_gate_exps_NxMxE->abs_offset, gate_total,
+            K, n_embd, n_ff_exp, c->ffn_normed_1xN, 0))
+        return 0;
+
+    if (dbg_breaks) {
+        L26F_DBG_CHECKPOINT("fused_gate_8xM", c->moe_expert_gate_8xM, (uint64_t)K * n_ff_exp);
+    }
+
+    // 5. Fused up matvec
+    if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_up_8xM,
+            m->map, m->size, c->moe_up_off_K,
+            wt_up_exps_NxMxE->abs_offset, up_total,
+            K, n_embd, n_ff_exp, c->ffn_normed_1xN, 0))
+        return 0;
+
+    if (dbg_breaks) {
+        L26F_DBG_CHECKPOINT("fused_up_8xM", c->moe_expert_up_8xM, (uint64_t)K * n_ff_exp);
+    }
+
+    // 6. Fused SwiGLU
+    if (!l26f_metal_fused_swiglu(c->moe_expert_mid_8xM,
+            c->moe_expert_gate_8xM, c->moe_expert_up_8xM,
+            K, n_ff_exp))
+        return 0;
+
+    if (dbg_breaks) {
+        L26F_DBG_CHECKPOINT("fused_mid_8xM", c->moe_expert_mid_8xM, (uint64_t)K * n_ff_exp);
+    }
+
+    // 7. Fused down matvec
+    if (wt_down_exps_MxNxE->type == 13) {
+        if (!l26f_metal_fused_moe_q5k(c->moe_expert_down_8xN,
+                m->map, m->size, c->moe_down_off_K,
+                wt_down_exps_MxNxE->abs_offset, down_total,
+                K, n_ff_exp, n_embd, c->moe_expert_mid_8xM))
+            return 0;
+    } else {
+        if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_down_8xN,
+                m->map, m->size, c->moe_down_off_K,
+                wt_down_exps_MxNxE->abs_offset, down_total,
+                K, n_ff_exp, n_embd, c->moe_expert_mid_8xM, 1))
+            return 0;
+    }
+
+    if (dbg_breaks) {
+        L26F_DBG_CHECKPOINT("fused_down_8xN", c->moe_expert_down_8xN, (uint64_t)K * n_embd);
+    }
+
+    // 8. Shared expert (same as per-expert path)
+    if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_gate_sh_NxM->abs_offset,
+            wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1], wt_gate_sh_NxM->type, 1))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_up_sh_NxM->abs_offset,
+            wt_up_sh_NxM->dim[0], wt_up_sh_NxM->dim[1], wt_up_sh_NxM->type, 1))
+        return 0;
+    if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff_exp, 0.0f, 1.0f))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->shexp_out_1xN, c->ffn_mid_1xF,
+            m->map, m->size, wt_down_sh_MxN->abs_offset,
+            wt_down_sh_MxN->dim[0], wt_down_sh_MxN->dim[1], wt_down_sh_MxN->type, 1))
+        return 0;
+
+    if (dbg_breaks) {
+        L26F_DBG_CHECKPOINT("fused_shexp_out", c->shexp_out_1xN, n_embd);
+    }
+
+    // 9. Fused accumulate: weighted sum of 8 experts + shared expert
+    if (!l26f_metal_fused_accum(c->moe_out_1xN,
+            c->moe_expert_down_8xN, c->moe_sel_wt_K, c->shexp_out_1xN,
+            K, n_embd))
+        return 0;
+
+    L26F_DBG_CHECKPOINT("fused_moe_out", c->moe_out_1xN, n_embd);
+
+    // 10. Residual add
+    if (!ds4_metal_add_tensor(out, inp, c->moe_out_1xN, n_embd))
+        return 0;
+
+    L26F_DBG_CHECKPOINT("fused_final_out", out, n_embd);
+
+    return 1;
+}
+
+#ifdef L26F_DBG_COMPARE
+
+// Run both per-expert (path A) and fused (path B) for one MoE layer,
+// compare at every pipeline stage.
+
+static int l26f_moe_ffn_compare(
+        l26f_session *s, uint32_t layer,
+        ds4_metal_tensor *inp, ds4_metal_tensor *out)
+{
+    l26f_model *m = s->model;
+    l26f_compute *c = &s->comp;
+    const uint32_t n_embd = m->n_embd;
+    const uint32_t n_ff_exp = 1024;
+    const uint32_t n_expert = 256;
+    const uint32_t n_groups = 8;
+    const uint32_t n_exp_per_group = n_expert / n_groups;
+    const float w_scale = 2.5f;
+    const int K = 8;
+    const uint64_t act_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t ffn_bytes = (uint64_t)n_ff_exp * sizeof(float);
+
+    fprintf(stderr, "\n=== L26F_DBG_COMPARE layer %u ===\n", layer);
+
+    l26f_tensor *wt_norm_N          = l26f_layer_tensor(m, layer, "ffn_norm.weight");
+    l26f_tensor *wt_gate_inp_NxE    = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
+    l26f_tensor *wt_exp_b_1xE       = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
+    l26f_tensor *wt_gate_exps_NxMxE = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
+    l26f_tensor *wt_up_exps_NxMxE   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
+    l26f_tensor *wt_down_exps_MxNxE = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
+    l26f_tensor *wt_gate_sh_NxM     = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
+    l26f_tensor *wt_up_sh_NxM       = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
+    l26f_tensor *wt_down_sh_MxN     = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
+
+    // Shared RMS norm (same for both paths)
+    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed_1xN, inp,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
+        return 0;
+    L26F_DBG_CHECKPOINT("shared_rms_norm", c->ffn_normed_1xN, n_embd);
+
+    // Save ffn_normed for fused path (both paths read from same buffer, but
+    // per-expert path doesn't modify it, so this is safe)
+    float *ffn_normed_copy = (float *)malloc(act_bytes);
+    if (!ffn_normed_copy) return 0;
+    L26F_DBG_READ(c->ffn_normed_1xN, ffn_normed_copy, n_embd);
+
+    // ---- PATH A: Per-expert (working) ----
+    fprintf(stderr, "--- PATH A: Per-expert ---\n");
+
+    // Router matvec
+    if (!ds4_metal_matmul_f32_tensor(c->router_logits_1xE, m->map, m->size,
+            wt_gate_inp_NxE->abs_offset, n_embd, n_expert, c->ffn_normed_1xN, 1))
+        return 0;
+    L26F_DBG_CHECKPOINT("A_router_logits", c->router_logits_1xE, n_expert);
+
+    // Routing
+    int32_t has_bias = (wt_exp_b_1xE != NULL) ? 1 : 0;
+    uint64_t bias_off = has_bias ? wt_exp_b_1xE->abs_offset : 0;
+    if (!l26f_metal_moe_route(c->router_logits_1xE, m->map, m->size,
+            bias_off, has_bias,
+            c->moe_sel_idx_K, c->moe_sel_wt_K,
+            n_expert, n_groups, n_exp_per_group, 4, K, w_scale))
+        return 0;
+
+    int32_t selected_experts_K[8];
+    float selected_weights_K[8];
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read(c->moe_sel_idx_K, 0, selected_experts_K, K * sizeof(int32_t));
+    ds4_metal_tensor_read(c->moe_sel_wt_K,  0, selected_weights_K, K * sizeof(float));
+    ds4_metal_begin_commands();
+
+    fprintf(stderr, "A selected: ");
+    for (int i = 0; i < K; i++)
+        fprintf(stderr, "%d(%.4f)%s", selected_experts_K[i], selected_weights_K[i],
+                i < K-1 ? " " : "\n");
+
+    // Per-expert byte strides
+    const uint32_t gate_bs = l26f_types[wt_gate_exps_NxMxE->type].block_size;
+    const uint32_t gate_ts = l26f_types[wt_gate_exps_NxMxE->type].type_size;
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps_NxMxE->dim[1] * ((uint64_t)wt_gate_exps_NxMxE->dim[0] / gate_bs) * gate_ts;
+    const uint32_t up_bs = l26f_types[wt_up_exps_NxMxE->type].block_size;
+    const uint32_t up_ts = l26f_types[wt_up_exps_NxMxE->type].type_size;
+    const uint64_t up_exp_bytes = (uint64_t)wt_up_exps_NxMxE->dim[1] * ((uint64_t)wt_up_exps_NxMxE->dim[0] / up_bs) * up_ts;
+    const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
+    const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * ((uint64_t)wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
+
+    // Allocate CPU buffers for per-expert intermediate results
+    float *A_gate_8xM = (float *)malloc((uint64_t)K * n_ff_exp * sizeof(float));
+    float *A_up_8xM   = (float *)malloc((uint64_t)K * n_ff_exp * sizeof(float));
+    float *A_mid_8xM  = (float *)malloc((uint64_t)K * n_ff_exp * sizeof(float));
+    float *A_down_8xN = (float *)malloc((uint64_t)K * n_embd * sizeof(float));
+    float *A_moe_out  = (float *)malloc(act_bytes);
+    if (!A_gate_8xM || !A_up_8xM || !A_mid_8xM || !A_down_8xN || !A_moe_out)
+        return 0;
+
+    ds4_metal_tensor_fill(c->moe_out_1xN, 0.0f);
+
+    for (int i = 0; i < K; i++) {
+        int e = selected_experts_K[i];
+        uint64_t gate_off = wt_gate_exps_NxMxE->abs_offset + (uint64_t)e * gate_exp_bytes;
+        uint64_t up_off   = wt_up_exps_NxMxE->abs_offset   + (uint64_t)e * up_exp_bytes;
+        uint64_t down_off = wt_down_exps_MxNxE->abs_offset + (uint64_t)e * down_exp_bytes;
+
+        // Gate
+        if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
+                m->map, m->size, gate_off,
+                n_embd, n_ff_exp, wt_gate_exps_NxMxE->type, 1))
+            return 0;
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(c->ffn_gate_1xF, 0, A_gate_8xM + (uint64_t)i * n_ff_exp, ffn_bytes);
+        ds4_metal_begin_commands();
+
+        // Up
+        if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
+                m->map, m->size, up_off,
+                n_embd, n_ff_exp, wt_up_exps_NxMxE->type, 1))
+            return 0;
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(c->ffn_up_1xF, 0, A_up_8xM + (uint64_t)i * n_ff_exp, ffn_bytes);
+        ds4_metal_begin_commands();
+
+        // SwiGLU
+        if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff_exp, 0.0f, 1.0f))
+            return 0;
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(c->ffn_mid_1xF, 0, A_mid_8xM + (uint64_t)i * n_ff_exp, ffn_bytes);
+        ds4_metal_begin_commands();
+
+        // Down
+        if (!l26f_metal_matvec_quant(c->ffn_down_1xN, c->ffn_mid_1xF,
+                m->map, m->size, down_off,
+                n_ff_exp, n_embd, wt_down_exps_MxNxE->type, 1))
+            return 0;
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(c->ffn_down_1xN, 0, A_down_8xN + (uint64_t)i * n_embd, act_bytes);
+        ds4_metal_begin_commands();
+
+        // axpy
+        if (!l26f_metal_axpy(c->moe_out_1xN, c->ffn_down_1xN, selected_weights_K[i], n_embd))
+            return 0;
+    }
+
+    // Shared expert
+    if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_gate_sh_NxM->abs_offset,
+            wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1], wt_gate_sh_NxM->type, 1))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
+            m->map, m->size, wt_up_sh_NxM->abs_offset,
+            wt_up_sh_NxM->dim[0], wt_up_sh_NxM->dim[1], wt_up_sh_NxM->type, 1))
+        return 0;
+    if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff_exp, 0.0f, 1.0f))
+        return 0;
+    if (!l26f_metal_matvec_quant(c->shexp_out_1xN, c->ffn_mid_1xF,
+            m->map, m->size, wt_down_sh_MxN->abs_offset,
+            wt_down_sh_MxN->dim[0], wt_down_sh_MxN->dim[1], wt_down_sh_MxN->type, 1))
+        return 0;
+    if (!l26f_metal_axpy(c->moe_out_1xN, c->shexp_out_1xN, 1.0f, n_embd))
+        return 0;
+
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read(c->moe_out_1xN, 0, A_moe_out, act_bytes);
+    ds4_metal_begin_commands();
+    L26F_DBG_CHECKPOINT("A_moe_out", c->moe_out_1xN, n_embd);
+
+    // Residual
+    if (!ds4_metal_add_tensor(out, inp, c->moe_out_1xN, n_embd))
+        return 0;
+    float *A_final = (float *)malloc(act_bytes);
+    if (!A_final) return 0;
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read(out, 0, A_final, act_bytes);
+    ds4_metal_begin_commands();
+
+    fprintf(stderr, "--- PATH A complete ---\n\n");
+
+    // ---- PATH B: Fused ----
+    fprintf(stderr, "--- PATH B: Fused ---\n");
+
+    // Restore ffn_normed (should be unchanged since per-expert path only reads it)
+    ds4_metal_tensor_write(c->ffn_normed_1xN, 0, ffn_normed_copy, act_bytes);
+
+    // Need separate output buffer for fused path
+    ds4_metal_tensor *fused_out = ds4_metal_tensor_alloc(act_bytes);
+    if (!fused_out) return 0;
+    ds4_metal_tensor_fill(fused_out, 0.0f);
+
+    if (!l26f_moe_ffn_fused(s, layer, inp, fused_out)) {
+        fprintf(stderr, "Fused path failed!\n");
+        ds4_metal_tensor_free(fused_out);
+        return 0;
+    }
+
+    float *B_final = (float *)malloc(act_bytes);
+    if (!B_final) return 0;
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read(fused_out, 0, B_final, act_bytes);
+    ds4_metal_begin_commands();
+
+    // Also read fused intermediates
+    float *B_gate_8xM = (float *)malloc((uint64_t)K * n_ff_exp * sizeof(float));
+    float *B_up_8xM   = (float *)malloc((uint64_t)K * n_ff_exp * sizeof(float));
+    float *B_mid_8xM  = (float *)malloc((uint64_t)K * n_ff_exp * sizeof(float));
+    float *B_down_8xN = (float *)malloc((uint64_t)K * n_embd * sizeof(float));
+    if (!B_gate_8xM || !B_up_8xM || !B_mid_8xM || !B_down_8xN) return 0;
+
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read(c->moe_expert_gate_8xM, 0, B_gate_8xM, (uint64_t)K * n_ff_exp * sizeof(float));
+    ds4_metal_tensor_read(c->moe_expert_up_8xM, 0, B_up_8xM, (uint64_t)K * n_ff_exp * sizeof(float));
+    ds4_metal_tensor_read(c->moe_expert_mid_8xM, 0, B_mid_8xM, (uint64_t)K * n_ff_exp * sizeof(float));
+    ds4_metal_tensor_read(c->moe_expert_down_8xN, 0, B_down_8xN, (uint64_t)K * n_embd * sizeof(float));
+    ds4_metal_begin_commands();
+
+    // ---- COMPARE ----
+    fprintf(stderr, "\n=== COMPARISON: Path A (per-expert) vs Path B (fused) ===\n");
+    L26F_DBG_ASSERT_EQ("gate_8xM", A_gate_8xM, B_gate_8xM, (uint64_t)K * n_ff_exp);
+    L26F_DBG_ASSERT_EQ("up_8xM",   A_up_8xM,   B_up_8xM,   (uint64_t)K * n_ff_exp);
+    L26F_DBG_ASSERT_EQ("mid_8xM",  A_mid_8xM,  B_mid_8xM,  (uint64_t)K * n_ff_exp);
+    L26F_DBG_ASSERT_EQ("down_8xN", A_down_8xN, B_down_8xN, (uint64_t)K * n_embd);
+    L26F_DBG_ASSERT_EQ("final",    A_final,     B_final,    n_embd);
+
+    // Copy fused output to actual output
+    ds4_metal_tensor_write(out, 0, B_final, act_bytes);
+
+    free(A_gate_8xM); free(A_up_8xM); free(A_mid_8xM); free(A_down_8xN); free(A_moe_out); free(A_final);
+    free(B_gate_8xM); free(B_up_8xM); free(B_mid_8xM); free(B_down_8xN); free(B_final);
+    free(ffn_normed_copy);
+    ds4_metal_tensor_free(fused_out);
+
+    fprintf(stderr, "=== END COMPARE ===\n\n");
+    return 1;
+}
+
+#endif // L26F_DBG_COMPARE
+#endif // L26F_DBG_FUSED
 
 static int l26f_session_init(l26f_session *s, l26f_model *m) {
     memset(s, 0, sizeof(*s));
@@ -737,14 +1452,30 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
     for (uint32_t il = 0; il < 32; il++) {
         if (model->is_mla[il]) {
             if (use_gpu_mla()) {
-                // GPU MLA: all ops are GPU kernels, no command buffer break needed
                 ds4_metal_tensor *mla_out_1xN = session->comp.post_attn_1xN;
                 if (!l26f_mla_layer_gpu(model, il, position, session->mla_kv_gpu[il],
-                                         session->mla_comp, session->hidden_1xN, mla_out_1xN)) {
+                                          session->mla_comp, session->hidden_1xN, mla_out_1xN)) {
                     fprintf(stderr, "MLA GPU layer %u failed\n", il);
                     return 0;
                 }
-                if (!l26f_moe_ffn(session, il, mla_out_1xN, session->hidden_1xN)) {
+#ifdef L26F_DBG_COMPARE
+                if ((int)il == l26f_dbg_get_layer()) {
+                    if (!l26f_moe_ffn_compare(session, il, mla_out_1xN, session->hidden_1xN)) {
+                        fprintf(stderr, "MoE COMPARE layer %u failed\n", il);
+                        return 0;
+                    }
+                } else
+#elif defined(L26F_DBG_FUSED)
+                if ((int)il == l26f_dbg_get_layer()) {
+                    if (!l26f_moe_ffn_fused(session, il, mla_out_1xN, session->hidden_1xN)) {
+                        fprintf(stderr, "MoE FUSED layer %u failed\n", il);
+                        return 0;
+                    }
+                } else
+#endif
+                if (!(l26f_use_fused_moe() ?
+                      l26f_moe_ffn_fused_prod(session, il, mla_out_1xN, session->hidden_1xN) :
+                      l26f_moe_ffn(session, il, mla_out_1xN, session->hidden_1xN))) {
                     fprintf(stderr, "MoE FFN layer %u failed\n", il);
                     return 0;
                 }
@@ -755,7 +1486,7 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
                 float *hidden_out = (float *)malloc(act_bytes);
                 ds4_metal_tensor_read(session->hidden_1xN, 0, hidden_cpu, act_bytes);
                 if (!l26f_mla_layer_cpu(model, il, position, session->mla_kv_cpu[il],
-                                         hidden_cpu, hidden_out)) {
+                                          hidden_cpu, hidden_out)) {
                     fprintf(stderr, "MLA CPU layer %u failed\n", il);
                     free(hidden_cpu); free(hidden_out);
                     return 0;
@@ -765,7 +1496,24 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
                 free(hidden_cpu);
                 free(hidden_out);
                 ds4_metal_begin_commands();
-                if (!l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN)) {
+#ifdef L26F_DBG_COMPARE
+                if ((int)il == l26f_dbg_get_layer()) {
+                    if (!l26f_moe_ffn_compare(session, il, out_1xN, session->hidden_1xN)) {
+                        fprintf(stderr, "MoE COMPARE layer %u failed\n", il);
+                        return 0;
+                    }
+                } else
+#elif defined(L26F_DBG_FUSED)
+                if ((int)il == l26f_dbg_get_layer()) {
+                    if (!l26f_moe_ffn_fused(session, il, out_1xN, session->hidden_1xN)) {
+                        fprintf(stderr, "MoE FUSED layer %u failed\n", il);
+                        return 0;
+                    }
+                } else
+#endif
+                if (!(l26f_use_fused_moe() ?
+                      l26f_moe_ffn_fused_prod(session, il, out_1xN, session->hidden_1xN) :
+                      l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN))) {
                     fprintf(stderr, "MoE FFN layer %u failed\n", il);
                     return 0;
                 }
@@ -789,12 +1537,39 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
             }
             if (verbose) printf("  layer %u: GLA + dense FFN\n", il);
         } else {
-            if (!l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN)) {
+#ifdef L26F_DBG_COMPARE
+            if ((int)il == l26f_dbg_get_layer()) {
+                if (!l26f_moe_ffn_compare(session, il, out_1xN, session->hidden_1xN)) {
+                    fprintf(stderr, "MoE COMPARE layer %u failed\n", il);
+                    return 0;
+                }
+            } else
+#elif defined(L26F_DBG_FUSED)
+            if ((int)il == l26f_dbg_get_layer()) {
+                if (!l26f_moe_ffn_fused(session, il, out_1xN, session->hidden_1xN)) {
+                    fprintf(stderr, "MoE FUSED layer %u failed\n", il);
+                    return 0;
+                }
+            } else
+#endif
+            if (!(l26f_use_fused_moe() ?
+                  l26f_moe_ffn_fused_prod(session, il, out_1xN, session->hidden_1xN) :
+                  l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN))) {
                 fprintf(stderr, "MoE FFN layer %u failed\n", il);
                 return 0;
             }
             if (verbose && il < 8) printf("  layer %u: GLA + MoE\n", il);
         }
+
+#ifdef L26F_DBG_FUSED
+        {
+            ds4_metal_end_commands();
+            int nans;
+            float sum = l26f_tensor_checksum(session->hidden_1xN, act_bytes, &nans);
+            fprintf(stderr, "LAYER %2u hidden sum=%.4f nans=%d\n", il, sum, nans);
+            ds4_metal_begin_commands();
+        }
+#endif
     }
 
     if (!ds4_metal_end_commands()) {
