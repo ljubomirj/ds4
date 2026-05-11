@@ -111,11 +111,21 @@ See `docs/13-naming-conventions.md` for the full suffix system.
 ## Workflow
 
 - Agent modifies code. LJ commits to git and pushes to GitHub.
-- Commits and PRs are NOT the agent's responsibility.
+- **Commits and PRs are NOT the agent's responsibility.** Agents write files
+  but do not commit to git unless LJ explicitly asks. If LJ says "commit",
+  the agent may commit only the changes LJ specified.
 - Status updates go in `docs/` as numbered files (12, 13, 14, ...).
 - Time-dependent info goes in `docs/##_description.md` with ever-increasing numeric prefix.
 - Conventions and reference docs go in `docs/` with descriptive names.
 - AGENTS.md (this file) is the authoritative index of everything in docs/.
+
+### README.LJ — LJ's personal log
+
+LJ writes into `README.LJ` files. Agents may read these files but should
+know that their content may change at any time as LJ edits them. These are
+LJ's personal notes — discussions, plans, deliberations, conversation
+history, and records of what was done. Do not write to `README.LJ` unless
+explicitly asked.
 
 ## Debugging Pattern: XLOG Before Reasoning
 
