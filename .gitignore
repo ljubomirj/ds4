@@ -16,3 +16,7 @@ test_l26f
 .viminfo
 test_l26f_multilayer
 models
+README.LJ.[0-9]*
+OLD/
+.omx/
+*.bak

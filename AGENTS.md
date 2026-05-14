@@ -45,6 +45,8 @@ docs/                        All design, status, and convention documents
 | `12-status-tokenizer-partial.md` | 2026-05-10 | Tokenizer integration partial |
 | `15-status-tokenizer-working.md` | 2026-05-10 | Tokenizer working, text gen live, hash map deferred |
 | `16-resources-on-disk.md` | 2026-05-10 | Full index of on-disk reference resources |
+| `18-status-speed-oom-fallback.md` | 2026-05-11 | Speed work: Metal OOM diagnosis, batch chunking, exact model-view fallback |
+| `19-speed-log.md` | 2026-05-11 | Correctness harness, GLA argument-order fix, exact-view benchmark |
 
 ### Reference Documents
 

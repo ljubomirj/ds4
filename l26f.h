@@ -4,11 +4,12 @@
 #ifndef L26F_H
 #define L26F_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <string.h>
-#include <inttypes.h>
+// Required includes (must appear before this header in the .c file):
+//   #include <stdint.h>    // uint32_t, uint64_t, int32_t
+//   #include <stdbool.h>   // bool
+//   #include <string.h>    // strlen, memcmp (for l26f_str_eq)
+//   #include <stdlib.h>    // size_t (via stddef.h, usually pulled in)
+//   #include <inttypes.h>  // PRId64 etc (if used)
 
 #define L26F_MAX_DIMS  8
 #define L26F_MAX_LAYERS 33
@@ -52,7 +53,7 @@ static const char *l26f_type_name(uint32_t type) {
 }
 
 // ---- GGUF tensor descriptor ----
-typedef struct {
+typedef struct l26f_tensor {
     l26f_str name;
     uint32_t ndim;
     uint64_t dim[L26F_MAX_DIMS];
@@ -63,7 +64,7 @@ typedef struct {
 } l26f_tensor;
 
 // ---- GGUF model ----
-typedef struct {
+typedef struct l26f_model {
     int fd;
     const uint8_t *map;
     uint64_t size;

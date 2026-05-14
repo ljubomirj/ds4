@@ -1,7 +1,11 @@
 #ifndef L26F_TOKENIZER_H
 #define L26F_TOKENIZER_H
 
-#include "l26f.h"
+// Required includes (must appear before this header in the .c file):
+//   #include <stdint.h>    // uint32_t, int32_t, uint64_t
+//   #include <stdbool.h>   // bool
+
+struct l26f_model;
 
 typedef struct {
     char *text;
@@ -39,7 +43,7 @@ typedef struct {
 } l26f_tokenizer;
 
 l26f_tokenizer *l26f_tokenizer_open(const char *path);
-l26f_tokenizer *l26f_tokenizer_from_model(const l26f_model *m);
+l26f_tokenizer *l26f_tokenizer_from_model(const struct l26f_model *m);
 void l26f_tokenizer_close(l26f_tokenizer *t);
 
 int l26f_token_decode(const l26f_tokenizer *t, int32_t token_id, char *buf, int buf_size);

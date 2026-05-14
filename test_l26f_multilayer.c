@@ -2,12 +2,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdarg.h>
 #include <math.h>
 #include <time.h>
 #include <ctype.h>
+#include <inttypes.h>
+#include "xcommon.h"
 #include "l26f.h"
-#include "l26f_metal.h"
 #include "ds4_metal.h"
+#include "l26f_metal.h"
 #include "l26f_tokenizer.h"
 
 // Forward declarations for MLA CPU implementation
@@ -49,7 +54,10 @@ typedef struct {
     ds4_metal_tensor *normed_1xN;
     ds4_metal_tensor *qkv_1x3N;
     ds4_metal_tensor *gate_out_1xN;
+    ds4_metal_tensor *q_rope_1xN;
+    ds4_metal_tensor *k_rope_1xN;
     ds4_metal_tensor *gla_out_1xNxSxSxH;
+    ds4_metal_tensor *gated_gla_1xN;
     ds4_metal_tensor *attn_proj_1xN;
     ds4_metal_tensor *post_attn_1xN;
     ds4_metal_tensor *ffn_normed_1xN;
@@ -69,12 +77,45 @@ typedef struct {
     ds4_metal_tensor *moe_gate_off_K;
     ds4_metal_tensor *moe_up_off_K;
     ds4_metal_tensor *moe_down_off_K;
+    ds4_metal_tensor *moe_gate_cache_8xMxN;
+    ds4_metal_tensor *moe_up_cache_8xMxN;
+    ds4_metal_tensor *moe_down_cache_8xNxM;
 } l26f_compute;
+
+#define L26F_PREFILL_MAX_T 128
+typedef struct l26f_prefill_compute l26f_prefill_compute;
 
 // GLA state: one per GLA layer, persists across tokens
 typedef struct {
     ds4_metal_tensor *state;
 } l26f_gla_state;
+
+static int l26f_write_gla_slopes_1xN(
+        l26f_model *m,
+        uint32_t layer,
+        ds4_metal_tensor *g_slope_1xN) {
+    const uint32_t S = 128;
+    const uint32_t H = m->n_head;
+    const uint32_t n_embd = m->n_embd;
+    float *slopes_1xN = (float *)malloc((uint64_t)n_embd * sizeof(float));
+    if (!slopes_1xN) return 0;
+
+    const float rate = powf(2.0f, -(log2f((float)H) - 3.0f));
+    const uint32_t denom_layers = m->n_layer > 1 ? m->n_layer - 1 : 1;
+    const float layer_factor = 1.0f - ((float)layer / (float)denom_layers) + 1.0e-5f;
+    for (uint32_t h = 0; h < H; h++) {
+        const float exp_val = exp2f(-rate * (float)(h + 1));
+        const float slope = expf(-layer_factor * exp_val);
+        for (uint32_t d = 0; d < S; d++) {
+            slopes_1xN[h * S + d] = slope;
+        }
+    }
+
+    const int ok = ds4_metal_tensor_write(g_slope_1xN, 0, slopes_1xN,
+                                          (uint64_t)n_embd * sizeof(float));
+    free(slopes_1xN);
+    return ok;
+}
 
 typedef struct {
     l26f_model *model;
@@ -86,10 +127,37 @@ typedef struct {
     ds4_metal_tensor *hidden_1xN;
     ds4_metal_tensor *output_normed_1xN;
     ds4_metal_tensor *logits_1xV;
-    ds4_metal_tensor *moe_gate_all_off[32];
-    ds4_metal_tensor *moe_up_all_off[32];
-    ds4_metal_tensor *moe_down_all_off[32];
+    ds4_metal_tensor *sample_idx_1xI;
+    ds4_metal_tensor *moe_gate_all_off_1xE[32];
+    ds4_metal_tensor *moe_up_all_off_1xE[32];
+    ds4_metal_tensor *moe_down_all_off_1xE[32];
+    ds4_metal_tensor *moe_gate_cache_off_K[32];
+    ds4_metal_tensor *moe_up_cache_off_K[32];
+    ds4_metal_tensor *moe_down_cache_off_K[32];
+    ds4_metal_tensor *gla_slopes_1xN[32];
+    l26f_prefill_compute *prefill;
 } l26f_session;
+
+typedef struct l26f_prefill_compute {
+    uint32_t max_tokens;
+    ds4_metal_tensor *hidden_TxN;
+    ds4_metal_tensor *post_attn_TxN;
+    ds4_metal_tensor *normed_TxN;
+    ds4_metal_tensor *router_logits_TxE;
+    ds4_metal_tensor *sel_idx_TxK;
+    ds4_metal_tensor *sel_wt_TxK;
+    ds4_metal_tensor *tokens_per_expert_E;
+    ds4_metal_tensor *ids_buffer_ExT;
+    ds4_metal_tensor *gate_out_TxKxM;
+    ds4_metal_tensor *up_out_TxKxM;
+    ds4_metal_tensor *mid_TxKxM;
+    ds4_metal_tensor *down_out_TxKxN;
+    ds4_metal_tensor *moe_out_TxN;
+    ds4_metal_tensor *shexp_gate_1xF;
+    ds4_metal_tensor *shexp_up_1xF;
+    ds4_metal_tensor *shexp_mid_1xF;
+    ds4_metal_tensor *shexp_out_1xN;
+};
 
 // ---- helpers ----
 
@@ -115,10 +183,361 @@ static void l26f_checksum_print(const char *label, const ds4_metal_tensor *t, ui
     fprintf(stderr, "    CHECKSUM %-20s  sum=%.6f  nans=%d\n", label, sum, nans);
 }
 
+#ifndef L26F_XLOG_LEVEL
+#define L26F_XLOG_LEVEL 1
+#endif
+
+#if L26F_XLOG_LEVEL >= 1
+static int XREG_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        enabled = getenv("L26F_REGRESSION") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int XREG_LAYERS_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        enabled = getenv("L26F_REGRESSION_LAYERS") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+#define XLOG_REG_FPRINTF(...) fprintf(stderr, __VA_ARGS__)
+#define XLOG_REG(args) do { \
+    if (XREG_ENABLED()) { \
+        fprintf(stderr, "REG "); \
+        XLOG_REG_FPRINTF args; \
+        fputc('\n', stderr); \
+    } \
+} while (0)
+#define XLOG_REG_LAYER(args) do { \
+    if (XREG_LAYERS_ENABLED()) { \
+        fprintf(stderr, "REG "); \
+        XLOG_REG_FPRINTF args; \
+        fputc('\n', stderr); \
+    } \
+} while (0)
+#define XLOG_MODEL(args) do { \
+    fprintf(stderr, "XMODEL "); \
+    XLOG_REG_FPRINTF args; \
+    fputc('\n', stderr); \
+} while (0)
+#define XLOG_PROF(args) do { \
+    if (XPROF_ENABLED()) { \
+        fprintf(stderr, "XPROF "); \
+        XLOG_REG_FPRINTF args; \
+        fputc('\n', stderr); \
+    } \
+} while (0)
+typedef struct {
+    float sum;
+    float min;
+    float max;
+    int   nans;
+} XREG_TENSOR_SUMMARY_1xU;
+
+static XREG_TENSOR_SUMMARY_1xU XREG_TENSOR_SUMMARIZE_1xU(const ds4_metal_tensor *t_1xU, uint64_t bytes) {
+    XREG_TENSOR_SUMMARY_1xU s_1xU = {0.0f, 0.0f, 0.0f, -1};
+    float *data_1xU = (float *)malloc(bytes);
+    if (!data_1xU) return s_1xU;
+    if (!ds4_metal_tensor_read(t_1xU, 0, data_1xU, bytes)) {
+        free(data_1xU);
+        return s_1xU;
+    }
+
+    const uint64_t n = bytes / sizeof(float);
+    int have_value = 0;
+    s_1xU.nans = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        float v = data_1xU[i];
+        if (isnan(v)) {
+            s_1xU.nans++;
+            continue;
+        }
+        s_1xU.sum += v;
+        if (!have_value) {
+            s_1xU.min = v;
+            s_1xU.max = v;
+            have_value = 1;
+        } else {
+            if (v < s_1xU.min) s_1xU.min = v;
+            if (v > s_1xU.max) s_1xU.max = v;
+        }
+    }
+    free(data_1xU);
+    return s_1xU;
+}
+
+#else
+#define XLOG_REG_FPRINTF(...) ((void)0)
+#define XLOG_REG(args)       ((void)0)
+#define XLOG_REG_LAYER(args) ((void)0)
+#define XLOG_MODEL(args)     ((void)0)
+#define XLOG_PROF(args)      ((void)0)
+#endif
+
+typedef enum {
+    XPROF_GLA = 0,
+    XPROF_GLA_NORM,
+    XPROF_GLA_QKV,
+    XPROF_GLA_GATE,
+    XPROF_GLA_ATTN,
+    XPROF_GLA_PROJ,
+    XPROF_MLA,
+    XPROF_MOE,
+    XPROF_MOE_NORM,
+    XPROF_MOE_ROUTER,
+    XPROF_MOE_ROUTE,
+    XPROF_MOE_OFFSETS,
+    XPROF_MOE_GATE_UP,
+    XPROF_MOE_DOWN,
+    XPROF_MOE_SHARED,
+    XPROF_MOE_ACCUM,
+    XPROF_MOE_RESIDUAL,
+    XPROF_DENSE,
+    XPROF_LOGITS,
+    XPROF_LOGITS_NORM,
+    XPROF_LOGITS_HEAD,
+    XPROF_SAMPLE,
+    XPROF_COUNT
+} XPROF_STAGE;
+
+typedef struct {
+    double ms;
+    uint64_t count;
+} XPROF_ACCUM;
+
+static XPROF_ACCUM XPROF_TOTALS[XPROF_COUNT];
+
+static __attribute__((unused)) const char *XPROF_STAGE_NAME(XPROF_STAGE stage) {
+    switch (stage) {
+    case XPROF_GLA:    return "gla";
+    case XPROF_GLA_NORM: return "gla_norm";
+    case XPROF_GLA_QKV:  return "gla_qkv";
+    case XPROF_GLA_GATE: return "gla_gate";
+    case XPROF_GLA_ATTN: return "gla_attn";
+    case XPROF_GLA_PROJ: return "gla_proj";
+    case XPROF_MLA:    return "mla";
+    case XPROF_MOE:    return "moe";
+    case XPROF_MOE_NORM:     return "moe_norm";
+    case XPROF_MOE_ROUTER:   return "moe_router";
+    case XPROF_MOE_ROUTE:    return "moe_route";
+    case XPROF_MOE_OFFSETS:  return "moe_offsets";
+    case XPROF_MOE_GATE_UP:  return "moe_gate_up";
+    case XPROF_MOE_DOWN:     return "moe_down";
+    case XPROF_MOE_SHARED:   return "moe_shared";
+    case XPROF_MOE_ACCUM:    return "moe_accum";
+    case XPROF_MOE_RESIDUAL: return "moe_residual";
+    case XPROF_DENSE:  return "dense";
+    case XPROF_LOGITS: return "logits";
+    case XPROF_LOGITS_NORM: return "logits_norm";
+    case XPROF_LOGITS_HEAD: return "logits_head";
+    case XPROF_SAMPLE: return "sample";
+    default:           return "unknown";
+    }
+}
+
+static int XPROF_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        enabled = getenv("L26F_PROFILE") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int XPROF_SYNC_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        enabled = getenv("L26F_PROFILE_SYNC") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int XPROF_GLA_DEEP_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        enabled = getenv("L26F_PROFILE_GLA") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int XPROF_MOE_DEEP_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        enabled = getenv("L26F_PROFILE_MOE") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static double XPROF_NOW_MS(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+static int XPROF_STAGE_BEGIN(double *t_ms) {
+    if (!XPROF_ENABLED()) {
+        if (t_ms) *t_ms = 0.0;
+        return 1;
+    }
+    if (XPROF_SYNC_ENABLED()) {
+        if (!ds4_metal_synchronize()) return 0;
+        if (!ds4_metal_begin_commands()) return 0;
+    }
+    if (t_ms) *t_ms = XPROF_NOW_MS();
+    return 1;
+}
+
+static int XPROF_STAGE_END(XPROF_STAGE stage, uint32_t layer, double t_ms) {
+    (void)layer;
+    if (!XPROF_ENABLED()) return 1;
+    if (XPROF_SYNC_ENABLED()) {
+        if (!ds4_metal_end_commands()) return 0;
+    }
+    const double elapsed_ms = XPROF_NOW_MS() - t_ms;
+    XPROF_TOTALS[stage].ms += elapsed_ms;
+    XPROF_TOTALS[stage].count++;
+    XLOG_PROF(("stage=%s layer=%u ms=%.3f", XPROF_STAGE_NAME(stage), layer, elapsed_ms));
+    if (XPROF_SYNC_ENABLED()) {
+        if (!ds4_metal_begin_commands()) return 0;
+    }
+    return 1;
+}
+
+static int XPROF_MOE_STAGE_BEGIN(double *t_ms) {
+    if (!XPROF_MOE_DEEP_ENABLED()) {
+        if (t_ms) *t_ms = 0.0;
+        return 1;
+    }
+    return XPROF_STAGE_BEGIN(t_ms);
+}
+
+static int XPROF_MOE_STAGE_END(XPROF_STAGE stage, uint32_t layer, double t_ms) {
+    if (!XPROF_MOE_DEEP_ENABLED()) return 1;
+    return XPROF_STAGE_END(stage, layer, t_ms);
+}
+
+static void XPROF_DIRECT_ADD(XPROF_STAGE stage, double elapsed_ms) {
+    if (!XPROF_ENABLED()) return;
+    XPROF_TOTALS[stage].ms += elapsed_ms;
+    XPROF_TOTALS[stage].count++;
+    XLOG_PROF(("stage=%s layer=999 ms=%.3f", XPROF_STAGE_NAME(stage), elapsed_ms));
+}
+
+static int XPROF_STANDALONE_BEGIN(double *t_ms) {
+    if (!XPROF_ENABLED()) {
+        if (t_ms) *t_ms = 0.0;
+        return 1;
+    }
+    if (XPROF_SYNC_ENABLED()) {
+        if (!ds4_metal_synchronize()) return 0;
+    }
+    if (t_ms) *t_ms = XPROF_NOW_MS();
+    return 1;
+}
+
+static int XPROF_STANDALONE_END(XPROF_STAGE stage, uint32_t layer, double t_ms) {
+    if (!XPROF_ENABLED()) return 1;
+    if (XPROF_SYNC_ENABLED()) {
+        if (!ds4_metal_synchronize()) return 0;
+    }
+    const double elapsed_ms = XPROF_NOW_MS() - t_ms;
+    XPROF_TOTALS[stage].ms += elapsed_ms;
+    XPROF_TOTALS[stage].count++;
+    XLOG_PROF(("stage=%s layer=%u ms=%.3f", XPROF_STAGE_NAME(stage), layer, elapsed_ms));
+    return 1;
+}
+
+static void XPROF_PRINT_TOTALS(void) {
+    if (!XPROF_ENABLED()) return;
+    for (int i = 0; i < XPROF_COUNT; i++) {
+        if (XPROF_TOTALS[i].count == 0) continue;
+        XLOG_PROF(("summary stage=%s count=%llu total_ms=%.3f avg_ms=%.3f",
+                   XPROF_STAGE_NAME((XPROF_STAGE)i),
+                   (unsigned long long)XPROF_TOTALS[i].count,
+                   XPROF_TOTALS[i].ms,
+                   XPROF_TOTALS[i].ms / (double)XPROF_TOTALS[i].count));
+    }
+}
+
+static void XREG_PRINT_TENSOR_1xU(const char *label, const ds4_metal_tensor *t_1xU, uint64_t bytes) {
+#if L26F_XLOG_LEVEL >= 1
+    if (!XREG_ENABLED()) return;
+    XREG_TENSOR_SUMMARY_1xU s_1xU = XREG_TENSOR_SUMMARIZE_1xU(t_1xU, bytes);
+    XLOG_REG(("tensor=%s sum=%.9g min=%.9g max=%.9g nans=%d",
+              label, s_1xU.sum, s_1xU.min, s_1xU.max, s_1xU.nans));
+#else
+    (void)label; (void)t_1xU; (void)bytes;
+#endif
+}
+
+static void XREG_PRINT_LAYER_HIDDEN_1xN(uint32_t layer, const ds4_metal_tensor *hidden_1xN, uint64_t bytes) {
+#if L26F_XLOG_LEVEL >= 1
+    if (!XREG_LAYERS_ENABLED()) return;
+    XREG_TENSOR_SUMMARY_1xU s_1xN = XREG_TENSOR_SUMMARIZE_1xU(hidden_1xN, bytes);
+    XLOG_REG_LAYER(("layer=%u hidden_1xN sum=%.9g min=%.9g max=%.9g nans=%d",
+                    layer, s_1xN.sum, s_1xN.min, s_1xN.max, s_1xN.nans));
+#else
+    (void)layer; (void)hidden_1xN; (void)bytes;
+#endif
+}
+
 static l26f_tensor *l26f_layer_tensor(const l26f_model *m, uint32_t layer, const char *suffix) {
     char name[128];
     snprintf(name, sizeof(name), "blk.%u.%s", layer, suffix);
     return l26f_model_find_tensor(m, name);
+}
+
+static int XMODEL_TENSOR_RANGE(const l26f_model *m, uint64_t *range_off, uint64_t *range_bytes) {
+    if (!m || !range_off || !range_bytes || m->n_tensors == 0) return 0;
+
+    uint64_t min_off = UINT64_MAX;
+    uint64_t max_end = 0;
+    uint64_t max_tensor_bytes = 0;
+    l26f_str max_tensor_name = {0};
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const l26f_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return 0;
+
+        const uint64_t end = t->abs_offset + t->bytes;
+        if (t->abs_offset < min_off) min_off = t->abs_offset;
+        if (end > max_end) max_end = end;
+        if (t->bytes > max_tensor_bytes) {
+            max_tensor_bytes = t->bytes;
+            max_tensor_name = t->name;
+        }
+    }
+
+    if (min_off == UINT64_MAX || max_end <= min_off) return 0;
+    *range_off = min_off;
+    *range_bytes = max_end - min_off;
+#if L26F_XLOG_LEVEL < 1
+    (void)max_tensor_bytes;
+    (void)max_tensor_name;
+#endif
+    XLOG_MODEL(("tensor_range off=%.2f MiB bytes=%.2f MiB max_tensor=%.2f MiB %.*s",
+                min_off / 1024.0 / 1024.0,
+                (max_end - min_off) / 1024.0 / 1024.0,
+                max_tensor_bytes / 1024.0 / 1024.0,
+                (int)(max_tensor_name.len < 48 ? max_tensor_name.len : 48),
+                max_tensor_name.ptr ? max_tensor_name.ptr : ""));
+    return 1;
 }
 
 // =========================================================================
@@ -272,7 +691,7 @@ static void L26F_DBG_READ(const ds4_metal_tensor *t, float *dst, uint64_t nfloat
 #endif // L26F_DBG_FUSED
 
 static int l26f_gla_layer(
-        l26f_session *s, uint32_t layer,
+        l26f_session *s, uint32_t layer, int position,
         ds4_metal_tensor *inp, ds4_metal_tensor *out) {
     l26f_model *m = s->model;
     l26f_compute *c = &s->comp;
@@ -283,52 +702,102 @@ static int l26f_gla_layer(
 
     l26f_tensor *wt_norm_N      = l26f_layer_tensor(m, layer, "attn_norm.weight");
     l26f_tensor *wt_qkv_Nx3N    = l26f_layer_tensor(m, layer, "attn_qkv.weight");
+    l26f_tensor *wt_q_norm_S    = l26f_layer_tensor(m, layer, "attn_q_norm.weight");
+    l26f_tensor *wt_k_norm_S    = l26f_layer_tensor(m, layer, "attn_k_norm.weight");
     l26f_tensor *wt_gate_NxN    = l26f_layer_tensor(m, layer, "attn_gate.weight");
+    l26f_tensor *wt_layer_out_N = l26f_layer_tensor(m, layer, "layer_output_norm.weight");
     l26f_tensor *wt_out_NxN     = l26f_layer_tensor(m, layer, "attn_output.weight");
-    if (!wt_norm_N || !wt_qkv_Nx3N || !wt_gate_NxN || !wt_out_NxN) {
+    if (!wt_norm_N || !wt_qkv_Nx3N || !wt_q_norm_S || !wt_k_norm_S ||
+        !wt_gate_NxN || !wt_layer_out_N || !wt_out_NxN) {
         fprintf(stderr, "l26f: layer %u missing GLA tensors\n", layer);
         return 0;
     }
 
     // 1. RMS norm
+    double XPROF_T0 = 0.0;
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
     if (!ds4_metal_rms_norm_weight_tensor(c->normed_1xN, inp,
             m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
         return 0;
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_NORM, layer, XPROF_T0)) return 0;
 
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
     if (!l26f_metal_matvec_quant(c->qkv_1x3N, c->normed_1xN,
             m->map, m->size, wt_qkv_Nx3N->abs_offset,
             wt_qkv_Nx3N->dim[0], wt_qkv_Nx3N->dim[1], wt_qkv_Nx3N->type, 1))
         return 0;
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_QKV, layer, XPROF_T0)) return 0;
 
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
     if (!l26f_metal_matvec_quant(c->gate_out_1xN, c->normed_1xN,
             m->map, m->size, wt_gate_NxN->abs_offset,
             wt_gate_NxN->dim[0], wt_gate_NxN->dim[1], wt_gate_NxN->type, 1))
         return 0;
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_GATE, layer, XPROF_T0)) return 0;
 
     ds4_metal_tensor *q_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, 0, act_bytes);
     ds4_metal_tensor *k_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, act_bytes, act_bytes);
     ds4_metal_tensor *v_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, 2*act_bytes, act_bytes);
+    if (!q_view_1xN || !k_view_1xN || !v_view_1xN) {
+        ds4_metal_tensor_free(v_view_1xN);
+        ds4_metal_tensor_free(k_view_1xN);
+        ds4_metal_tensor_free(q_view_1xN);
+        return 0;
+    }
 
-    int ok = l26f_metal_gla(c->gla_out_1xNxSxSxH, s->gla_states[layer].state,
-                q_view_1xN, k_view_1xN, v_view_1xN, c->gate_out_1xN,
+    int ok = l26f_metal_gla_qk_norm_rope(c->q_rope_1xN, c->k_rope_1xN,
+                    q_view_1xN, k_view_1xN,
+                    m->map, m->size, wt_q_norm_S->abs_offset, wt_k_norm_S->abs_offset,
+                    S, H, position, m->rope_theta, m->rms_norm_eps);
+    if (ok && !s->gla_slopes_1xN[layer]) ok = 0;
+    if (!ok) {
+        ds4_metal_tensor_free(v_view_1xN);
+        ds4_metal_tensor_free(k_view_1xN);
+        ds4_metal_tensor_free(q_view_1xN);
+        return 0;
+    }
+
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+    ok = l26f_metal_gla(c->gla_out_1xNxSxSxH, s->gla_states[layer].state,
+                c->k_rope_1xN, v_view_1xN, c->q_rope_1xN, s->gla_slopes_1xN[layer],
                 1, 1, S, H, scale);
+    if (ok && XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_ATTN, layer, XPROF_T0)) ok = 0;
 
     ds4_metal_tensor_free(v_view_1xN);
     ds4_metal_tensor_free(k_view_1xN);
     ds4_metal_tensor_free(q_view_1xN);
     if (!ok) return 0;
 
-    // 5. Output projection (first n_embd floats of gla_out are the attention output)
+    // 5. llama.cpp GLA epilogue: group RMS norm, layer output norm, sigmoid gate
+    //    and output projection. First n_embd floats of gla_out are the activations.
     ds4_metal_tensor *gla_act_1xN = ds4_metal_tensor_view(c->gla_out_1xNxSxSxH, 0, act_bytes);
-    ok = l26f_metal_matvec_quant(c->attn_proj_1xN, gla_act_1xN,
-            m->map, m->size, wt_out_NxN->abs_offset,
-            wt_out_NxN->dim[0], wt_out_NxN->dim[1], wt_out_NxN->type, 1);
+    if (!gla_act_1xN) return 0;
+    ok = l26f_metal_gla_epilogue(c->gated_gla_1xN, gla_act_1xN, c->gate_out_1xN,
+            m->map, m->size, wt_layer_out_N->abs_offset, n_embd, 4, m->rms_norm_eps);
+    if (!ok) {
+        ds4_metal_tensor_free(gla_act_1xN);
+        return 0;
+    }
+
+    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+    if (wt_out_NxN->type == 20) {
+        ok = l26f_metal_matvec_iq4_nl_residual(out, c->gated_gla_1xN, inp,
+                m->map, m->size, wt_out_NxN->abs_offset,
+                wt_out_NxN->dim[0], wt_out_NxN->dim[1]);
+    } else {
+        ok = l26f_metal_matvec_quant(c->attn_proj_1xN, c->gated_gla_1xN,
+                m->map, m->size, wt_out_NxN->abs_offset,
+                wt_out_NxN->dim[0], wt_out_NxN->dim[1], wt_out_NxN->type, 1);
+    }
+    if (ok && XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_PROJ, layer, XPROF_T0)) ok = 0;
     ds4_metal_tensor_free(gla_act_1xN);
     if (!ok) return 0;
 
     // 6. Residual add: out = inp + attn_proj
-    if (!ds4_metal_add_tensor(out, inp, c->attn_proj_1xN, n_embd))
-        return 0;
+    if (wt_out_NxN->type != 20) {
+        if (!ds4_metal_add_tensor(out, inp, c->attn_proj_1xN, n_embd))
+            return 0;
+    }
 
     return 1;
 }
@@ -427,8 +896,8 @@ static int l26f_moe_ffn(
     l26f_tensor *wt_gate_sh_NxM     = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
     l26f_tensor *wt_up_sh_NxM       = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
     l26f_tensor *wt_down_sh_MxN     = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
-    if (!wt_norm_N || !wt_gate_inp_NxE || !wt_gate_exps_NxMxE || !wt_up_exps_NxMxE || !wt_down_exps_MxNxE ||
-        !wt_gate_sh_NxM || !wt_up_sh_NxM || !wt_down_sh_MxN) {
+    if (!wt_norm_N || !wt_gate_inp_NxE || !wt_gate_exps_NxMxE || !wt_up_exps_NxMxE ||
+        !wt_down_exps_MxNxE || !wt_gate_sh_NxM || !wt_up_sh_NxM || !wt_down_sh_MxN) {
         fprintf(stderr, "l26f: layer %u missing MoE tensors\n", layer);
         return 0;
     }
@@ -543,7 +1012,17 @@ static int l26f_use_fused_moe(void) {
     return use_fused;
 }
 
-static int l26f_moe_ffn_fused_prod(
+static int l26f_use_hybrid_moe(void) {
+    static int initialized = 0;
+    static int use_hybrid = 0;
+    if (!initialized) {
+        use_hybrid = getenv("L26F_HYBRID_MOE") != NULL;
+        initialized = 1;
+    }
+    return use_hybrid;
+}
+
+static int l26f_moe_ffn_hybrid(
         l26f_session *s, uint32_t layer,
         ds4_metal_tensor *inp, ds4_metal_tensor *out) {
     l26f_model *m = s->model;
@@ -587,15 +1066,12 @@ static int l26f_moe_ffn_fused_prod(
             n_expert, n_groups, n_exp_per_group, 4, K, w_scale))
         return 0;
 
-    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_gate_all_off[layer],
-            c->moe_gate_off_K, K))
-        return 0;
-    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_up_all_off[layer],
-            c->moe_up_off_K, K))
-        return 0;
-    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_down_all_off[layer],
-            c->moe_down_off_K, K))
-        return 0;
+    int32_t selected_experts_K[8];
+    float selected_weights_K[8];
+    ds4_metal_end_commands();
+    ds4_metal_tensor_read(c->moe_sel_idx_K, 0, selected_experts_K, K * sizeof(int32_t));
+    ds4_metal_tensor_read(c->moe_sel_wt_K,  0, selected_weights_K, K * sizeof(float));
+    ds4_metal_begin_commands();
 
     const uint32_t gate_bs = l26f_types[wt_gate_exps_NxMxE->type].block_size;
     const uint32_t gate_ts = l26f_types[wt_gate_exps_NxMxE->type].type_size;
@@ -610,18 +1086,23 @@ static int l26f_moe_ffn_fused_prod(
     const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
     const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
     const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * ((uint64_t)wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
-    const uint64_t down_total = (uint64_t)n_expert * down_exp_bytes;
 
-    if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_gate_8xM,
-            m->map, m->size, c->moe_gate_off_K,
+    uint64_t gate_off_K[8], up_off_K[8];
+    for (int i = 0; i < K; i++) {
+        const uint64_t e = (uint64_t)selected_experts_K[i];
+        gate_off_K[i] = e * gate_exp_bytes;
+        up_off_K[i] = e * up_exp_bytes;
+    }
+    ds4_metal_tensor_write(c->moe_gate_off_K, 0, gate_off_K, sizeof(gate_off_K));
+    ds4_metal_tensor_write(c->moe_up_off_K, 0, up_off_K, sizeof(up_off_K));
+
+    if (!l26f_metal_fused_moe_iq4nl_gate_up(
+            c->moe_expert_gate_8xM, c->moe_expert_up_8xM,
+            m->map, m->size,
+            c->moe_gate_off_K, c->moe_up_off_K,
             wt_gate_exps_NxMxE->abs_offset, gate_total,
-            K, n_embd, n_ff_exp, c->ffn_normed_1xN, 0))
-        return 0;
-
-    if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_up_8xM,
-            m->map, m->size, c->moe_up_off_K,
             wt_up_exps_NxMxE->abs_offset, up_total,
-            K, n_embd, n_ff_exp, c->ffn_normed_1xN, 0))
+            K, n_embd, n_ff_exp, c->ffn_normed_1xN))
         return 0;
 
     if (!l26f_metal_fused_swiglu(c->moe_expert_mid_8xM,
@@ -629,17 +1110,21 @@ static int l26f_moe_ffn_fused_prod(
             K, n_ff_exp))
         return 0;
 
-    if (wt_down_exps_MxNxE->type == 13) {
-        if (!l26f_metal_fused_moe_q5k(c->moe_expert_down_8xN,
-                m->map, m->size, c->moe_down_off_K,
-                wt_down_exps_MxNxE->abs_offset, down_total,
-                K, n_ff_exp, n_embd, c->moe_expert_mid_8xM))
-            return 0;
-    } else {
-        if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_down_8xN,
-                m->map, m->size, c->moe_down_off_K,
-                wt_down_exps_MxNxE->abs_offset, down_total,
-                K, n_ff_exp, n_embd, c->moe_expert_mid_8xM, 1))
+    ds4_metal_tensor_fill(c->moe_out_1xN, 0.0f);
+    const uint64_t ffn_bytes = (uint64_t)n_ff_exp * sizeof(float);
+    for (int i = 0; i < K; i++) {
+        const int e = selected_experts_K[i];
+        const uint64_t down_off = wt_down_exps_MxNxE->abs_offset + (uint64_t)e * down_exp_bytes;
+        ds4_metal_tensor *mid_i_1xM = ds4_metal_tensor_view(c->moe_expert_mid_8xM, (uint64_t)i * ffn_bytes, ffn_bytes);
+        if (!mid_i_1xM) return 0;
+
+        int ok = l26f_metal_matvec_quant(c->ffn_down_1xN, mid_i_1xM,
+                m->map, m->size, down_off,
+                n_ff_exp, n_embd, wt_down_exps_MxNxE->type, 1);
+        ds4_metal_tensor_free(mid_i_1xM);
+        if (!ok) return 0;
+
+        if (!l26f_metal_axpy(c->moe_out_1xN, c->ffn_down_1xN, selected_weights_K[i], n_embd))
             return 0;
     }
 
@@ -657,10 +1142,7 @@ static int l26f_moe_ffn_fused_prod(
             m->map, m->size, wt_down_sh_MxN->abs_offset,
             wt_down_sh_MxN->dim[0], wt_down_sh_MxN->dim[1], wt_down_sh_MxN->type, 1))
         return 0;
-
-    if (!l26f_metal_fused_accum(c->moe_out_1xN,
-            c->moe_expert_down_8xN, c->moe_sel_wt_K, c->shexp_out_1xN,
-            K, n_embd))
+    if (!l26f_metal_axpy(c->moe_out_1xN, c->shexp_out_1xN, 1.0f, n_embd))
         return 0;
 
     if (!ds4_metal_add_tensor(out, inp, c->moe_out_1xN, n_embd))
@@ -669,8 +1151,457 @@ static int l26f_moe_ffn_fused_prod(
     return 1;
 }
 
+static int l26f_moe_ffn_fused_prod(
+        l26f_session *s, uint32_t layer,
+        ds4_metal_tensor *inp, ds4_metal_tensor *out) {
+    l26f_model *m = s->model;
+    l26f_compute *c = &s->comp;
+    const uint32_t n_embd = m->n_embd;
+    const uint32_t n_ff_exp = 1024;
+    const uint32_t n_expert = 256;
+    const uint32_t n_groups = 8;
+    const uint32_t n_exp_per_group = n_expert / n_groups;
+    const float w_scale = 2.5f;
+    const int K = 8;
+
+    l26f_tensor *wt_norm_N          = l26f_layer_tensor(m, layer, "ffn_norm.weight");
+    l26f_tensor *wt_gate_inp_NxE    = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
+    l26f_tensor *wt_exp_b_1xE       = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
+    l26f_tensor *wt_gate_exps_NxMxE = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
+    l26f_tensor *wt_up_exps_NxMxE   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
+    l26f_tensor *wt_down_exps_MxNxE = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
+    l26f_tensor *wt_gate_sh_NxM     = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
+    l26f_tensor *wt_up_sh_NxM       = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
+    l26f_tensor *wt_down_sh_MxN     = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
+    if (!wt_norm_N || !wt_gate_inp_NxE || !wt_gate_exps_NxMxE || !wt_up_exps_NxMxE ||
+        !wt_down_exps_MxNxE || !wt_gate_sh_NxM || !wt_up_sh_NxM || !wt_down_sh_MxN) {
+        fprintf(stderr, "l26f: layer %u missing MoE tensors\n", layer);
+        return 0;
+    }
+
+    double XPROF_MOE_T0 = 0.0;
+    if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+    if (!ds4_metal_rms_norm_weight_tensor(c->ffn_normed_1xN, inp,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, m->rms_norm_eps))
+        return 0;
+    if (!XPROF_MOE_STAGE_END(XPROF_MOE_NORM, layer, XPROF_MOE_T0)) return 0;
+
+    if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+    if (!ds4_metal_matmul_f32_tensor(c->router_logits_1xE, m->map, m->size,
+            wt_gate_inp_NxE->abs_offset, n_embd, n_expert, c->ffn_normed_1xN, 1))
+        return 0;
+    if (!XPROF_MOE_STAGE_END(XPROF_MOE_ROUTER, layer, XPROF_MOE_T0)) return 0;
+
+    int32_t has_bias = (wt_exp_b_1xE != NULL) ? 1 : 0;
+    uint64_t bias_off = has_bias ? wt_exp_b_1xE->abs_offset : 0;
+    if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+    if (!l26f_metal_moe_route_offsets(c->router_logits_1xE, m->map, m->size,
+            bias_off, has_bias,
+            c->moe_sel_idx_K, c->moe_sel_wt_K,
+            s->moe_gate_all_off_1xE[layer], s->moe_up_all_off_1xE[layer], s->moe_down_all_off_1xE[layer],
+            c->moe_gate_off_K, c->moe_up_off_K, c->moe_down_off_K,
+            n_expert, n_groups, n_exp_per_group, 4, K, w_scale))
+        return 0;
+    if (!XPROF_MOE_STAGE_END(XPROF_MOE_ROUTE, layer, XPROF_MOE_T0)) return 0;
+
+    const uint32_t gate_bs = l26f_types[wt_gate_exps_NxMxE->type].block_size;
+    const uint32_t gate_ts = l26f_types[wt_gate_exps_NxMxE->type].type_size;
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps_NxMxE->dim[1] * ((uint64_t)wt_gate_exps_NxMxE->dim[0] / gate_bs) * gate_ts;
+    const uint64_t gate_total = (uint64_t)n_expert * gate_exp_bytes;
+
+    const uint32_t up_bs = l26f_types[wt_up_exps_NxMxE->type].block_size;
+    const uint32_t up_ts = l26f_types[wt_up_exps_NxMxE->type].type_size;
+    const uint64_t up_exp_bytes = (uint64_t)wt_up_exps_NxMxE->dim[1] * ((uint64_t)wt_up_exps_NxMxE->dim[0] / up_bs) * up_ts;
+    const uint64_t up_total = (uint64_t)n_expert * up_exp_bytes;
+
+    const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
+    const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * ((uint64_t)wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
+    const uint64_t down_total = (uint64_t)n_expert * down_exp_bytes;
+
+    // Gather 8 selected experts into contiguous cache for better locality
+    static int use_cache = -1;
+    if (use_cache < 0) use_cache = getenv("L26F_EXPERT_CACHE") != NULL;
+
+    if (use_cache) {
+        if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+        if (!l26f_metal_gather_experts(c->moe_gate_cache_8xMxN, m->map, m->size,
+                wt_gate_exps_NxMxE->abs_offset, gate_total,
+                gate_exp_bytes, gate_exp_bytes,
+                c->moe_sel_idx_K, K))
+            return 0;
+        if (!l26f_metal_gather_experts(c->moe_up_cache_8xMxN, m->map, m->size,
+                wt_up_exps_NxMxE->abs_offset, up_total,
+                up_exp_bytes, up_exp_bytes,
+                c->moe_sel_idx_K, K))
+            return 0;
+        if (!l26f_metal_gather_experts(c->moe_down_cache_8xNxM, m->map, m->size,
+                wt_down_exps_MxNxE->abs_offset, down_total,
+                down_exp_bytes, down_exp_bytes,
+                c->moe_sel_idx_K, K))
+            return 0;
+        if (!XPROF_MOE_STAGE_END(XPROF_MOE_OFFSETS, layer, XPROF_MOE_T0)) return 0;
+
+        // Offsets into the contiguous K-expert cache are fixed and initialized
+        // once in l26f_session_init. Do not write CPU data during the batch.
+
+        if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+        if (!l26f_metal_fused_moe_iq4nl_gate_up_swiglu_cached(
+                c->moe_expert_mid_8xM,
+                c->moe_gate_cache_8xMxN, c->moe_up_cache_8xMxN,
+                s->moe_gate_cache_off_K[layer], s->moe_up_cache_off_K[layer],
+                K, n_embd, n_ff_exp, c->ffn_normed_1xN))
+            return 0;
+        if (!XPROF_MOE_STAGE_END(XPROF_MOE_GATE_UP, layer, XPROF_MOE_T0)) return 0;
+
+        if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+        if (wt_down_exps_MxNxE->type == 13) {
+            if (!l26f_metal_fused_moe_q5k_cached(c->moe_expert_down_8xN,
+                    c->moe_down_cache_8xNxM, s->moe_down_cache_off_K[layer],
+                    K, n_ff_exp, n_embd, c->moe_expert_mid_8xM))
+                return 0;
+        } else {
+            if (!l26f_metal_fused_moe_iq4nl_cached(c->moe_expert_down_8xN,
+                    c->moe_down_cache_8xNxM, s->moe_down_cache_off_K[layer],
+                    K, n_ff_exp, n_embd, c->moe_expert_mid_8xM, 1))
+                return 0;
+        }
+        if (!XPROF_MOE_STAGE_END(XPROF_MOE_DOWN, layer, XPROF_MOE_T0)) return 0;
+    } else {
+        if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+        if (!l26f_metal_fused_moe_iq4nl_gate_up_swiglu(
+                c->moe_expert_mid_8xM,
+                m->map, m->size,
+                c->moe_gate_off_K, c->moe_up_off_K,
+                wt_gate_exps_NxMxE->abs_offset, gate_total,
+                wt_up_exps_NxMxE->abs_offset, up_total,
+                K, n_embd, n_ff_exp, c->ffn_normed_1xN))
+            return 0;
+        if (!XPROF_MOE_STAGE_END(XPROF_MOE_GATE_UP, layer, XPROF_MOE_T0)) return 0;
+
+        if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+        if (wt_down_exps_MxNxE->type == 13) {
+            if (!l26f_metal_fused_moe_q5k(c->moe_expert_down_8xN,
+                    m->map, m->size, c->moe_down_off_K,
+                    wt_down_exps_MxNxE->abs_offset, down_total,
+                    K, n_ff_exp, n_embd, c->moe_expert_mid_8xM))
+                return 0;
+        } else {
+            if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_down_8xN,
+                    m->map, m->size, c->moe_down_off_K,
+                    wt_down_exps_MxNxE->abs_offset, down_total,
+                    K, n_ff_exp, n_embd, c->moe_expert_mid_8xM, 1))
+                return 0;
+        }
+        if (!XPROF_MOE_STAGE_END(XPROF_MOE_DOWN, layer, XPROF_MOE_T0)) return 0;
+    }
+
+    if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+    {
+        const uint32_t sh_bs = l26f_types[wt_gate_sh_NxM->type].block_size;
+        const uint32_t sh_ts = l26f_types[wt_gate_sh_NxM->type].type_size;
+        const uint64_t sh_gate_bytes = (uint64_t)wt_gate_sh_NxM->dim[1] * ((uint64_t)wt_gate_sh_NxM->dim[0] / sh_bs) * sh_ts;
+        const uint64_t sh_up_bytes   = (uint64_t)wt_up_sh_NxM->dim[1] * ((uint64_t)wt_up_sh_NxM->dim[0] / sh_bs) * sh_ts;
+
+        if (wt_gate_sh_NxM->type == 20 && wt_up_sh_NxM->type == 20) {
+            if (!l26f_metal_shared_gate_up_swiglu_iq4nl(c->ffn_mid_1xF,
+                    m->map, m->size,
+                    wt_gate_sh_NxM->abs_offset, sh_gate_bytes,
+                    wt_up_sh_NxM->abs_offset, sh_up_bytes,
+                    wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1],
+                    c->ffn_normed_1xN))
+                return 0;
+        } else {
+            if (!l26f_metal_matvec_quant(c->ffn_gate_1xF, c->ffn_normed_1xN,
+                    m->map, m->size, wt_gate_sh_NxM->abs_offset,
+                    wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1], wt_gate_sh_NxM->type, 1))
+                return 0;
+            if (!l26f_metal_matvec_quant(c->ffn_up_1xF, c->ffn_normed_1xN,
+                    m->map, m->size, wt_up_sh_NxM->abs_offset,
+                    wt_up_sh_NxM->dim[0], wt_up_sh_NxM->dim[1], wt_up_sh_NxM->type, 1))
+                return 0;
+            if (!ds4_metal_swiglu_tensor(c->ffn_mid_1xF, c->ffn_gate_1xF, c->ffn_up_1xF, n_ff_exp, 0.0f, 1.0f))
+                return 0;
+        }
+    }
+
+    if (!l26f_metal_matvec_quant(c->shexp_out_1xN, c->ffn_mid_1xF,
+            m->map, m->size, wt_down_sh_MxN->abs_offset,
+            wt_down_sh_MxN->dim[0], wt_down_sh_MxN->dim[1], wt_down_sh_MxN->type, 1))
+        return 0;
+    if (!XPROF_MOE_STAGE_END(XPROF_MOE_SHARED, layer, XPROF_MOE_T0)) return 0;
+
+    if (!XPROF_MOE_STAGE_BEGIN(&XPROF_MOE_T0)) return 0;
+    if (!l26f_metal_fused_accum_residual(out, inp,
+            c->moe_expert_down_8xN, c->moe_sel_wt_K, c->shexp_out_1xN,
+            K, n_embd))
+        return 0;
+    if (!XPROF_MOE_STAGE_END(XPROF_MOE_ACCUM, layer, XPROF_MOE_T0)) return 0;
+
+    return 1;
+}
+
+#ifdef L26F_PREFILL_DEBUG
+static void L26F_NAN_CHECK(const char *label, const float *data, uint32_t n, const char *ctx) {
+    int first_nan = -1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (isnan(data[i]) || isinf(data[i])) {
+            first_nan = (int)i;
+            break;
+        }
+    }
+    if (first_nan >= 0) {
+        fprintf(stderr, "  ** NaN/INF FIRST at %s [%s] elem %d val=%.6f (n=%u)\n",
+                label, ctx, first_nan, data[first_nan], n);
+    }
+}
+
+static void L26F_PREFILL_CKPT(const char *label, ds4_metal_tensor *t, uint64_t bytes,
+                               uint32_t il, int t_tok) {
+    int nans;
+    float sum = l26f_tensor_checksum(t, bytes, &nans);
+    fprintf(stderr, "  PREFILL L%u:t%d %-22s sum=%12.2f nans=%d\n", il, t_tok, label, sum, nans);
+    if (nans > 0) {
+        float *data = (float *)malloc(bytes);
+        if (data) {
+            ds4_metal_tensor_read(t, 0, data, bytes);
+            L26F_NAN_CHECK(label, data, (uint32_t)(bytes / sizeof(float)),
+                           il < 100 ? "layer" : "embed");
+            free(data);
+        }
+    }
+}
+#define L26F_PREFILL_CKPT(label, t, bytes, il, tt) L26F_PREFILL_CKPT(label, t, bytes, il, tt)
+#define L26F_NAN_CHECK(label, data, n, ctx) L26F_NAN_CHECK(label, data, n, ctx)
+#define L26F_PREFILL_LOG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#else
+#define L26F_PREFILL_CKPT(label, t, bytes, il, tt) ((void)0)
+#define L26F_NAN_CHECK(label, data, n, ctx) ((void)0)
+#define L26F_PREFILL_LOG(fmt, ...) ((void)0)
+#endif
+
 // =========================================================================
-// L26F_DBG: Fused MoE path for NaN debugging
+// Batch MoE FFN for prefill — uses mat-mat SGEMM kernel
+// Processes T tokens through MoE FFN for one layer using expert indirection.
+// inp_TxN: [T, N] input hidden states (post-attention)
+// out_TxN: [T, N] output hidden states
+// =========================================================================
+
+static int l26f_moe_ffn_batch(
+        l26f_session *s, uint32_t layer,
+        ds4_metal_tensor *inp_TxN,
+        ds4_metal_tensor *out_TxN,
+        uint32_t T)
+{
+    l26f_model *m = s->model;
+    l26f_prefill_compute *p = s->prefill;
+    const uint32_t n_embd = m->n_embd;
+    const uint32_t n_ff_exp = 1024;
+    const uint32_t n_expert = 256;
+    const uint32_t n_groups = 8;
+    const uint32_t n_exp_per_group = n_expert / n_groups;
+    const float w_scale = 2.5f;
+    const int K = 8;
+
+    l26f_tensor *wt_norm_N          = l26f_layer_tensor(m, layer, "ffn_norm.weight");
+    l26f_tensor *wt_gate_inp_NxE    = l26f_layer_tensor(m, layer, "ffn_gate_inp.weight");
+    l26f_tensor *wt_exp_b_1xE       = l26f_layer_tensor(m, layer, "exp_probs_b.bias");
+    l26f_tensor *wt_gate_exps_NxMxE = l26f_layer_tensor(m, layer, "ffn_gate_exps.weight");
+    l26f_tensor *wt_up_exps_NxMxE   = l26f_layer_tensor(m, layer, "ffn_up_exps.weight");
+    l26f_tensor *wt_down_exps_MxNxE = l26f_layer_tensor(m, layer, "ffn_down_exps.weight");
+    l26f_tensor *wt_gate_sh_NxM     = l26f_layer_tensor(m, layer, "ffn_gate_shexp.weight");
+    l26f_tensor *wt_up_sh_NxM       = l26f_layer_tensor(m, layer, "ffn_up_shexp.weight");
+    l26f_tensor *wt_down_sh_MxN     = l26f_layer_tensor(m, layer, "ffn_down_shexp.weight");
+    if (!wt_norm_N || !wt_gate_inp_NxE || !wt_gate_exps_NxMxE || !wt_up_exps_NxMxE ||
+        !wt_down_exps_MxNxE || !wt_gate_sh_NxM || !wt_up_sh_NxM || !wt_down_sh_MxN) {
+        fprintf(stderr, "l26f: layer %u missing MoE tensors\n", layer);
+        return 0;
+    }
+
+    if (!ds4_metal_rms_norm_weight_rows_tensor(p->normed_TxN, inp_TxN,
+            m->map, m->size, wt_norm_N->abs_offset, n_embd, T, m->rms_norm_eps)) {
+        fprintf(stderr, "  [batch_moe L%u] rms_norm failed\n", layer);
+        return 0;
+    }
+    if (layer <= 1) L26F_PREFILL_CKPT("normed_TxN", p->normed_TxN, (uint64_t)T * n_embd * sizeof(float), layer, -1);
+
+    {
+        ds4_metal_tensor *router_row_1xE = ds4_metal_tensor_view(p->router_logits_TxE,
+                (uint64_t)0, (uint64_t)n_expert * sizeof(float));
+        if (!router_row_1xE) { fprintf(stderr, "  [batch_moe L%u] router view failed\n", layer); return 0; }
+        int router_ok = 1;
+        for (uint32_t t = 0; t < T; t++) {
+            ds4_metal_tensor *normed_row_1xN = ds4_metal_tensor_view(p->normed_TxN,
+                (uint64_t)t * n_embd * sizeof(float), (uint64_t)n_embd * sizeof(float));
+            if (!normed_row_1xN) { router_ok = 0; break; }
+            ds4_metal_tensor *logits_row_1xE = ds4_metal_tensor_view(p->router_logits_TxE,
+                (uint64_t)t * n_expert * sizeof(float), (uint64_t)n_expert * sizeof(float));
+            if (!logits_row_1xE) { ds4_metal_tensor_free(normed_row_1xN); router_ok = 0; break; }
+            if (!ds4_metal_matmul_f32_tensor(logits_row_1xE, m->map, m->size,
+                    wt_gate_inp_NxE->abs_offset, n_embd, n_expert, normed_row_1xN, 1)) {
+                ds4_metal_tensor_free(normed_row_1xN);
+                ds4_metal_tensor_free(logits_row_1xE);
+                router_ok = 0;
+                break;
+            }
+            ds4_metal_tensor_free(normed_row_1xN);
+            ds4_metal_tensor_free(logits_row_1xE);
+        }
+        ds4_metal_tensor_free(router_row_1xE);
+        if (!router_ok) {
+            fprintf(stderr, "  [batch_moe L%u] router matmul failed at token %u\n", layer, T);
+            return 0;
+        }
+    }
+    if (layer <= 1) L26F_PREFILL_CKPT("router_logits_TxE", p->router_logits_TxE, (uint64_t)T * n_expert * sizeof(float), layer, -1);
+
+    int32_t has_bias = (wt_exp_b_1xE != NULL) ? 1 : 0;
+    uint64_t bias_off = has_bias ? wt_exp_b_1xE->abs_offset : 0;
+    if (!l26f_metal_moe_route_batch(p->router_logits_TxE, m->map, m->size,
+            bias_off, has_bias,
+            p->sel_idx_TxK, p->sel_wt_TxK,
+            n_expert, n_groups, n_exp_per_group, 4, K, w_scale, T)) {
+        fprintf(stderr, "  [batch_moe L%u] route_batch failed\n", layer);
+        return 0;
+    }
+    if (layer <= 1) {
+        L26F_PREFILL_CKPT("sel_idx_TxK", p->sel_idx_TxK, (uint64_t)T * K * sizeof(int32_t), layer, -1);
+        L26F_PREFILL_CKPT("sel_wt_TxK", p->sel_wt_TxK, (uint64_t)T * K * sizeof(float), layer, -1);
+    }
+
+    if (!l26f_metal_mul_mm_id_map0(p->sel_idx_TxK, p->tokens_per_expert_E,
+            p->ids_buffer_ExT, n_expert, T)) {
+        fprintf(stderr, "  [batch_moe L%u] map0 failed\n", layer);
+        return 0;
+    }
+    if (layer <= 1) L26F_PREFILL_CKPT("tokens_per_expert_E", p->tokens_per_expert_E, (uint64_t)n_expert * sizeof(uint32_t), layer, -1);
+
+    const uint32_t gate_bs = l26f_types[wt_gate_exps_NxMxE->type].block_size;
+    const uint32_t gate_ts = l26f_types[wt_gate_exps_NxMxE->type].type_size;
+    const uint64_t gate_exp_bytes = (uint64_t)wt_gate_exps_NxMxE->dim[1] * ((uint64_t)wt_gate_exps_NxMxE->dim[0] / gate_bs) * gate_ts;
+    const uint64_t gate_total = (uint64_t)n_expert * gate_exp_bytes;
+
+    const uint32_t up_bs = l26f_types[wt_up_exps_NxMxE->type].block_size;
+    const uint32_t up_ts = l26f_types[wt_up_exps_NxMxE->type].type_size;
+    const uint64_t up_exp_bytes = (uint64_t)wt_up_exps_NxMxE->dim[1] * ((uint64_t)wt_up_exps_NxMxE->dim[0] / up_bs) * up_ts;
+    const uint64_t up_total = (uint64_t)n_expert * up_exp_bytes;
+
+    const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
+    const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
+    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * ((uint64_t)wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
+    const uint64_t down_total = (uint64_t)n_expert * down_exp_bytes;
+
+    if (!l26f_metal_mul_mm_id_iq4nl(p->gate_out_TxKxM, m->map, m->size,
+            wt_gate_exps_NxMxE->abs_offset, gate_total,
+            n_expert, n_embd, n_ff_exp,
+            p->normed_TxN, p->tokens_per_expert_E, p->ids_buffer_ExT, T)) {
+        fprintf(stderr, "  [batch_moe L%u] gate mul_mm_id failed\n", layer);
+        return 0;
+    }
+    if (layer <= 1) L26F_PREFILL_CKPT("gate_out_TxKxM", p->gate_out_TxKxM, (uint64_t)T * K * n_ff_exp * sizeof(float), layer, -1);
+
+    if (!l26f_metal_mul_mm_id_iq4nl(p->up_out_TxKxM, m->map, m->size,
+            wt_up_exps_NxMxE->abs_offset, up_total,
+            n_expert, n_embd, n_ff_exp,
+            p->normed_TxN, p->tokens_per_expert_E, p->ids_buffer_ExT, T)) {
+        fprintf(stderr, "  [batch_moe L%u] up mul_mm_id failed\n", layer);
+        return 0;
+    }
+    if (layer <= 1) L26F_PREFILL_CKPT("up_out_TxKxM", p->up_out_TxKxM, (uint64_t)T * K * n_ff_exp * sizeof(float), layer, -1);
+
+    if (!l26f_metal_batch_swiglu(p->mid_TxKxM, p->gate_out_TxKxM, p->up_out_TxKxM, T * K * n_ff_exp)) {
+        fprintf(stderr, "  [batch_moe L%u] batch_swiglu failed\n", layer);
+        return 0;
+    }
+    if (layer <= 1) L26F_PREFILL_CKPT("mid_TxKxM", p->mid_TxKxM, (uint64_t)T * K * n_ff_exp * sizeof(float), layer, -1);
+
+    if (wt_down_exps_MxNxE->type == 20) {
+        if (!l26f_metal_mul_mm_id_iq4nl(p->down_out_TxKxN, m->map, m->size,
+                wt_down_exps_MxNxE->abs_offset, down_total,
+                n_expert, n_ff_exp, n_embd,
+                p->mid_TxKxM, p->tokens_per_expert_E, p->ids_buffer_ExT, T)) {
+            fprintf(stderr, "  [batch_moe L%u] down mul_mm_id iq4nl failed\n", layer);
+            return 0;
+        }
+    } else if (wt_down_exps_MxNxE->type == 13) {
+        if (!l26f_metal_mul_mm_id_q5k(p->down_out_TxKxN, m->map, m->size,
+                wt_down_exps_MxNxE->abs_offset, down_total,
+                n_expert, n_ff_exp, n_embd,
+                p->mid_TxKxM, p->tokens_per_expert_E, p->ids_buffer_ExT, T)) {
+            fprintf(stderr, "  [batch_moe L%u] down mul_mm_id q5k failed\n", layer);
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "  [batch_moe L%u] unsupported down type %u\n", layer, wt_down_exps_MxNxE->type);
+        return 0;
+    }
+    if (layer <= 1) L26F_PREFILL_CKPT("down_out_TxKxN", p->down_out_TxKxN, (uint64_t)T * K * n_embd * sizeof(float), layer, -1);
+
+    for (uint32_t t = 0; t < T; t++) {
+        ds4_metal_tensor *normed_row_1xN = ds4_metal_tensor_view(p->normed_TxN,
+            (uint64_t)t * n_embd * sizeof(float), (uint64_t)n_embd * sizeof(float));
+        if (!normed_row_1xN) return 0;
+
+        if (wt_gate_sh_NxM->type == 20 && wt_up_sh_NxM->type == 20) {
+            const uint32_t sh_bs = l26f_types[wt_gate_sh_NxM->type].block_size;
+            const uint32_t sh_ts = l26f_types[wt_gate_sh_NxM->type].type_size;
+            const uint64_t sh_gate_bytes = (uint64_t)wt_gate_sh_NxM->dim[1] * ((uint64_t)wt_gate_sh_NxM->dim[0] / sh_bs) * sh_ts;
+            const uint64_t sh_up_bytes   = (uint64_t)wt_up_sh_NxM->dim[1] * ((uint64_t)wt_up_sh_NxM->dim[0] / sh_bs) * sh_ts;
+
+            if (!l26f_metal_shared_gate_up_swiglu_iq4nl(p->shexp_mid_1xF,
+                    m->map, m->size,
+                    wt_gate_sh_NxM->abs_offset, sh_gate_bytes,
+                    wt_up_sh_NxM->abs_offset, sh_up_bytes,
+                    wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1],
+                    normed_row_1xN)) {
+                ds4_metal_tensor_free(normed_row_1xN);
+                return 0;
+            }
+        } else {
+            if (!l26f_metal_matvec_quant(p->shexp_gate_1xF, normed_row_1xN,
+                    m->map, m->size, wt_gate_sh_NxM->abs_offset,
+                    wt_gate_sh_NxM->dim[0], wt_gate_sh_NxM->dim[1], wt_gate_sh_NxM->type, 1)) {
+                ds4_metal_tensor_free(normed_row_1xN);
+                return 0;
+            }
+            if (!l26f_metal_matvec_quant(p->shexp_up_1xF, normed_row_1xN,
+                    m->map, m->size, wt_up_sh_NxM->abs_offset,
+                    wt_up_sh_NxM->dim[0], wt_up_sh_NxM->dim[1], wt_up_sh_NxM->type, 1)) {
+                ds4_metal_tensor_free(normed_row_1xN);
+                return 0;
+            }
+            if (!ds4_metal_swiglu_tensor(p->shexp_mid_1xF, p->shexp_gate_1xF, p->shexp_up_1xF, n_ff_exp, 0.0f, 1.0f)) {
+                ds4_metal_tensor_free(normed_row_1xN);
+                return 0;
+            }
+        }
+
+        if (!l26f_metal_matvec_quant(p->shexp_out_1xN, p->shexp_mid_1xF,
+                m->map, m->size, wt_down_sh_MxN->abs_offset,
+                wt_down_sh_MxN->dim[0], wt_down_sh_MxN->dim[1], wt_down_sh_MxN->type, 1)) {
+            ds4_metal_tensor_free(normed_row_1xN);
+            return 0;
+        }
+
+        float *sh_data_1xN = (float *)malloc((uint64_t)n_embd * sizeof(float));
+        if (!sh_data_1xN) { ds4_metal_tensor_free(normed_row_1xN); return 0; }
+        ds4_metal_tensor_read(p->shexp_out_1xN, 0, sh_data_1xN, (uint64_t)n_embd * sizeof(float));
+        ds4_metal_tensor_write(p->moe_out_TxN, (uint64_t)t * n_embd * sizeof(float), sh_data_1xN, (uint64_t)n_embd * sizeof(float));
+        free(sh_data_1xN);
+        ds4_metal_tensor_free(normed_row_1xN);
+    }
+
+    if (!l26f_metal_batch_accum(p->moe_out_TxN, p->down_out_TxKxN, p->sel_wt_TxK,
+            p->moe_out_TxN, T, K, n_embd))
+        return 0;
+    if (layer <= 1) L26F_PREFILL_CKPT("moe_out_TxN_after_accum", p->moe_out_TxN, (uint64_t)T * n_embd * sizeof(float), layer, -1);
+
+    if (!ds4_metal_add_tensor(out_TxN, inp_TxN, p->moe_out_TxN, T * n_embd))
+        return 0;
+    if (layer <= 1) L26F_PREFILL_CKPT("out_TxN_after_add", out_TxN, (uint64_t)T * n_embd * sizeof(float), layer, -1);
+
+    return 1;
+}
 // =========================================================================
 // Runs the fused kernel path with optional per-stage breaks and checkpoints.
 // When L26F_DBG_COMPARE is defined, also runs the per-expert path and compares.
@@ -736,14 +1667,9 @@ static int l26f_moe_ffn_fused(
                 i < K-1 ? " " : "\n");
 
     // 3. Gather expert weight offsets
-    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_gate_all_off[layer],
-            c->moe_gate_off_K, K))
-        return 0;
-    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_up_all_off[layer],
-            c->moe_up_off_K, K))
-        return 0;
-    if (!l26f_metal_gather_offsets(c->moe_sel_idx_K, s->moe_down_all_off[layer],
-            c->moe_down_off_K, K))
+    if (!l26f_metal_gather_offsets_3(c->moe_sel_idx_K,
+            s->moe_gate_all_off_1xE[layer], s->moe_up_all_off_1xE[layer], s->moe_down_all_off_1xE[layer],
+            c->moe_gate_off_K, c->moe_up_off_K, c->moe_down_off_K, K))
         return 0;
 
     if (dbg_breaks) {
@@ -760,20 +1686,6 @@ static int l26f_moe_ffn_fused(
 
     const uint32_t up_bs = l26f_types[wt_up_exps_NxMxE->type].block_size;
     const uint32_t up_ts = l26f_types[wt_up_exps_NxMxE->type].type_size;
-    const uint64_t up_exp_bytes = (uint64_t)wt_up_exps_NxMxE->dim[1] * ((uint64_t)wt_up_exps_NxMxE->dim[0] / up_bs) * up_ts;
-    const uint64_t up_total = (uint64_t)n_expert * up_exp_bytes;
-
-    const uint32_t down_bs = l26f_types[wt_down_exps_MxNxE->type].block_size;
-    const uint32_t down_ts = l26f_types[wt_down_exps_MxNxE->type].type_size;
-    const uint64_t down_exp_bytes = (uint64_t)wt_down_exps_MxNxE->dim[1] * ((uint64_t)wt_down_exps_MxNxE->dim[0] / down_bs) * down_ts;
-    const uint64_t down_total = (uint64_t)n_expert * down_exp_bytes;
-
-    // 4. Fused gate matvec (8 experts × 1024 outputs)
-    if (!l26f_metal_fused_moe_iq4nl(c->moe_expert_gate_8xM,
-            m->map, m->size, c->moe_gate_off_K,
-            wt_gate_exps_NxMxE->abs_offset, gate_total,
-            K, n_embd, n_ff_exp, c->ffn_normed_1xN, 0))
-        return 0;
 
     if (dbg_breaks) {
         L26F_DBG_CHECKPOINT("fused_gate_8xM", c->moe_expert_gate_8xM, (uint64_t)K * n_ff_exp);
@@ -1109,7 +2021,10 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     s->comp.normed_1xN      = ds4_metal_tensor_alloc(act_bytes);
     s->comp.qkv_1x3N         = ds4_metal_tensor_alloc(qkv_bytes);
     s->comp.gate_out_1xN    = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.q_rope_1xN      = ds4_metal_tensor_alloc(act_bytes);
+    s->comp.k_rope_1xN      = ds4_metal_tensor_alloc(act_bytes);
     s->comp.gla_out_1xNxSxSxH     = ds4_metal_tensor_alloc(gla_out_bytes);
+    s->comp.gated_gla_1xN   = ds4_metal_tensor_alloc(act_bytes);
     s->comp.attn_proj_1xN   = ds4_metal_tensor_alloc(act_bytes);
     s->comp.post_attn_1xN   = ds4_metal_tensor_alloc(act_bytes);
     s->comp.ffn_normed_1xN  = ds4_metal_tensor_alloc(act_bytes);
@@ -1130,15 +2045,24 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     s->comp.moe_up_off_K    = ds4_metal_tensor_alloc(8 * sizeof(uint64_t));
     s->comp.moe_down_off_K  = ds4_metal_tensor_alloc(8 * sizeof(uint64_t));
 
+    // Expert weight caches for fused MoE (8 experts contiguous)
+    s->comp.moe_gate_cache_8xMxN = ds4_metal_tensor_alloc((uint64_t)8 * 4096 * (1024 / 32) * 18);
+    s->comp.moe_up_cache_8xMxN   = ds4_metal_tensor_alloc((uint64_t)8 * 4096 * (1024 / 32) * 18);
+    s->comp.moe_down_cache_8xNxM = ds4_metal_tensor_alloc((uint64_t)8 * 1024 * (4096 / 256) * 176);
+
     s->hidden_1xN         = ds4_metal_tensor_alloc(act_bytes);
     s->output_normed_1xN  = ds4_metal_tensor_alloc(act_bytes);
     s->logits_1xV         = ds4_metal_tensor_alloc((uint64_t)m->n_vocab * sizeof(float));
+    s->sample_idx_1xI     = ds4_metal_tensor_alloc(sizeof(int32_t));
 
     // Zero all compute buffers to eliminate uninitialized-memory non-determinism
     ds4_metal_tensor_fill(s->comp.normed_1xN,      0.0f);
     ds4_metal_tensor_fill(s->comp.qkv_1x3N,         0.0f);
     ds4_metal_tensor_fill(s->comp.gate_out_1xN,    0.0f);
+    ds4_metal_tensor_fill(s->comp.q_rope_1xN,      0.0f);
+    ds4_metal_tensor_fill(s->comp.k_rope_1xN,      0.0f);
     ds4_metal_tensor_fill(s->comp.gla_out_1xNxSxSxH,     0.0f);
+    ds4_metal_tensor_fill(s->comp.gated_gla_1xN,   0.0f);
     ds4_metal_tensor_fill(s->comp.attn_proj_1xN,   0.0f);
     ds4_metal_tensor_fill(s->comp.post_attn_1xN,   0.0f);
     ds4_metal_tensor_fill(s->comp.ffn_normed_1xN,  0.0f);
@@ -1157,15 +2081,25 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     ds4_metal_tensor_fill(s->comp.moe_gate_off_K,  0.0f);
     ds4_metal_tensor_fill(s->comp.moe_up_off_K,    0.0f);
     ds4_metal_tensor_fill(s->comp.moe_down_off_K,  0.0f);
+    ds4_metal_tensor_fill(s->comp.moe_gate_cache_8xMxN, 0.0f);
+    ds4_metal_tensor_fill(s->comp.moe_up_cache_8xMxN,   0.0f);
+    ds4_metal_tensor_fill(s->comp.moe_down_cache_8xNxM, 0.0f);
     ds4_metal_tensor_fill(s->hidden_1xN,           0.0f);
     ds4_metal_tensor_fill(s->output_normed_1xN,    0.0f);
     ds4_metal_tensor_fill(s->logits_1xV,           0.0f);
+    ds4_metal_tensor_fill(s->sample_idx_1xI,       0);
 
     // GLA states for all GLA layers (28 layers: all except 7, 15, 23, 31)
     for (uint32_t i = 0; i < 32; i++) {
         if (m->is_mla[i]) continue;
         s->gla_states[i].state = ds4_metal_tensor_alloc(gla_state_bytes);
         if (!s->gla_states[i].state) { fprintf(stderr, "l26f: OOM GLA state %u\n", i); return 0; }
+        s->gla_slopes_1xN[i] = ds4_metal_tensor_alloc(act_bytes);
+        if (!s->gla_slopes_1xN[i]) { fprintf(stderr, "l26f: OOM GLA slope %u\n", i); return 0; }
+        if (!l26f_write_gla_slopes_1xN(m, i, s->gla_slopes_1xN[i])) {
+            fprintf(stderr, "l26f: failed to initialize GLA slope %u\n", i);
+            return 0;
+        }
         void *zeros = calloc(1, gla_state_bytes);
         if (zeros) {
             ds4_metal_tensor_write(s->gla_states[i].state, 0, zeros, gla_state_bytes);
@@ -1219,22 +2153,38 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
             down_offs[e] = (uint64_t)e * down_exp_bytes;
         }
 
-        s->moe_gate_all_off[il] = ds4_metal_tensor_alloc(256 * sizeof(uint64_t));
-        s->moe_up_all_off[il]   = ds4_metal_tensor_alloc(256 * sizeof(uint64_t));
-        s->moe_down_all_off[il] = ds4_metal_tensor_alloc(256 * sizeof(uint64_t));
-        if (!s->moe_gate_all_off[il] || !s->moe_up_all_off[il] || !s->moe_down_all_off[il]) {
+        uint64_t gate_cache_offs[8], up_cache_offs[8], down_cache_offs[8];
+        for (int e = 0; e < 8; e++) {
+            gate_cache_offs[e] = (uint64_t)e * gate_exp_bytes;
+            up_cache_offs[e]   = (uint64_t)e * up_exp_bytes;
+            down_cache_offs[e] = (uint64_t)e * down_exp_bytes;
+        }
+
+        s->moe_gate_all_off_1xE[il] = ds4_metal_tensor_alloc(256 * sizeof(uint64_t));
+        s->moe_up_all_off_1xE[il]   = ds4_metal_tensor_alloc(256 * sizeof(uint64_t));
+        s->moe_down_all_off_1xE[il] = ds4_metal_tensor_alloc(256 * sizeof(uint64_t));
+        s->moe_gate_cache_off_K[il] = ds4_metal_tensor_alloc(8 * sizeof(uint64_t));
+        s->moe_up_cache_off_K[il]   = ds4_metal_tensor_alloc(8 * sizeof(uint64_t));
+        s->moe_down_cache_off_K[il] = ds4_metal_tensor_alloc(8 * sizeof(uint64_t));
+        if (!s->moe_gate_all_off_1xE[il] || !s->moe_up_all_off_1xE[il] || !s->moe_down_all_off_1xE[il] ||
+            !s->moe_gate_cache_off_K[il] || !s->moe_up_cache_off_K[il] || !s->moe_down_cache_off_K[il]) {
             fprintf(stderr, "l26f: OOM MoE offset tables\n"); return 0;
         }
-        ds4_metal_tensor_write(s->moe_gate_all_off[il], 0, gate_offs, sizeof(gate_offs));
-        ds4_metal_tensor_write(s->moe_up_all_off[il],   0, up_offs,   sizeof(up_offs));
-        ds4_metal_tensor_write(s->moe_down_all_off[il], 0, down_offs, sizeof(down_offs));
+        ds4_metal_tensor_write(s->moe_gate_all_off_1xE[il], 0, gate_offs, sizeof(gate_offs));
+        ds4_metal_tensor_write(s->moe_up_all_off_1xE[il],   0, up_offs,   sizeof(up_offs));
+        ds4_metal_tensor_write(s->moe_down_all_off_1xE[il], 0, down_offs, sizeof(down_offs));
+        ds4_metal_tensor_write(s->moe_gate_cache_off_K[il], 0, gate_cache_offs, sizeof(gate_cache_offs));
+        ds4_metal_tensor_write(s->moe_up_cache_off_K[il],   0, up_cache_offs,   sizeof(up_cache_offs));
+        ds4_metal_tensor_write(s->moe_down_cache_off_K[il], 0, down_cache_offs, sizeof(down_cache_offs));
     }
 
     if (!s->comp.normed_1xN || !s->comp.qkv_1x3N || !s->comp.gate_out_1xN ||
-        !s->comp.gla_out_1xNxSxSxH || !s->comp.attn_proj_1xN || !s->comp.post_attn_1xN ||
+        !s->comp.q_rope_1xN || !s->comp.k_rope_1xN ||
+        !s->comp.gla_out_1xNxSxSxH || !s->comp.gated_gla_1xN ||
+        !s->comp.attn_proj_1xN || !s->comp.post_attn_1xN ||
         !s->comp.ffn_normed_1xN || !s->comp.ffn_gate_1xF || !s->comp.ffn_up_1xF ||
         !s->comp.ffn_mid_1xF || !s->comp.ffn_down_1xN ||
-        !s->hidden_1xN || !s->output_normed_1xN || !s->logits_1xV) {
+        !s->hidden_1xN || !s->output_normed_1xN || !s->logits_1xV || !s->sample_idx_1xI) {
         fprintf(stderr, "l26f: OOM compute buffers\n");
         return 0;
     }
@@ -1246,7 +2196,10 @@ static void l26f_session_free(l26f_session *s) {
     ds4_metal_tensor_free(s->comp.normed_1xN);
     ds4_metal_tensor_free(s->comp.qkv_1x3N);
     ds4_metal_tensor_free(s->comp.gate_out_1xN);
+    ds4_metal_tensor_free(s->comp.q_rope_1xN);
+    ds4_metal_tensor_free(s->comp.k_rope_1xN);
     ds4_metal_tensor_free(s->comp.gla_out_1xNxSxSxH);
+    ds4_metal_tensor_free(s->comp.gated_gla_1xN);
     ds4_metal_tensor_free(s->comp.attn_proj_1xN);
     ds4_metal_tensor_free(s->comp.post_attn_1xN);
     ds4_metal_tensor_free(s->comp.ffn_normed_1xN);
@@ -1265,13 +2218,19 @@ static void l26f_session_free(l26f_session *s) {
     ds4_metal_tensor_free(s->comp.moe_gate_off_K);
     ds4_metal_tensor_free(s->comp.moe_up_off_K);
     ds4_metal_tensor_free(s->comp.moe_down_off_K);
+    ds4_metal_tensor_free(s->comp.moe_gate_cache_8xMxN);
+    ds4_metal_tensor_free(s->comp.moe_up_cache_8xMxN);
+    ds4_metal_tensor_free(s->comp.moe_down_cache_8xNxM);
     ds4_metal_tensor_free(s->comp.router_logits_1xE);
     ds4_metal_tensor_free(s->hidden_1xN);
     ds4_metal_tensor_free(s->output_normed_1xN);
     ds4_metal_tensor_free(s->logits_1xV);
+    ds4_metal_tensor_free(s->sample_idx_1xI);
     for (uint32_t i = 0; i < 32; i++) {
         if (s->gla_states[i].state)
             ds4_metal_tensor_free(s->gla_states[i].state);
+        if (s->gla_slopes_1xN[i])
+            ds4_metal_tensor_free(s->gla_slopes_1xN[i]);
         if (s->mla_kv_gpu[i])
             l26f_mla_kv_cache_gpu_free(s->mla_kv_gpu[i]);
         if (s->mla_kv_cpu[i])
@@ -1280,10 +2239,80 @@ static void l26f_session_free(l26f_session *s) {
     if (s->mla_comp)
         l26f_mla_compute_free(s->mla_comp);
     for (uint32_t i = 0; i < 32; i++) {
-        if (s->moe_gate_all_off[i]) ds4_metal_tensor_free(s->moe_gate_all_off[i]);
-        if (s->moe_up_all_off[i])   ds4_metal_tensor_free(s->moe_up_all_off[i]);
-        if (s->moe_down_all_off[i]) ds4_metal_tensor_free(s->moe_down_all_off[i]);
+        if (s->moe_gate_all_off_1xE[i]) ds4_metal_tensor_free(s->moe_gate_all_off_1xE[i]);
+        if (s->moe_up_all_off_1xE[i])   ds4_metal_tensor_free(s->moe_up_all_off_1xE[i]);
+        if (s->moe_down_all_off_1xE[i]) ds4_metal_tensor_free(s->moe_down_all_off_1xE[i]);
+        if (s->moe_gate_cache_off_K[i]) ds4_metal_tensor_free(s->moe_gate_cache_off_K[i]);
+        if (s->moe_up_cache_off_K[i])   ds4_metal_tensor_free(s->moe_up_cache_off_K[i]);
+        if (s->moe_down_cache_off_K[i]) ds4_metal_tensor_free(s->moe_down_cache_off_K[i]);
     }
+}
+
+static l26f_prefill_compute *l26f_prefill_alloc(uint32_t n_embd, uint32_t n_ff_exp) {
+    const uint32_t Tmax = L26F_PREFILL_MAX_T;
+    const uint32_t K = 8;
+    const uint32_t E = 256;
+    const uint64_t act_T_bytes = (uint64_t)Tmax * n_embd * sizeof(float);
+    const uint64_t ffn_T_bytes = (uint64_t)Tmax * n_ff_exp * sizeof(float);
+
+    l26f_prefill_compute *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->max_tokens = Tmax;
+
+    p->hidden_TxN          = ds4_metal_tensor_alloc(act_T_bytes);
+    p->post_attn_TxN       = ds4_metal_tensor_alloc(act_T_bytes);
+    p->normed_TxN          = ds4_metal_tensor_alloc(act_T_bytes);
+    p->router_logits_TxE   = ds4_metal_tensor_alloc((uint64_t)Tmax * E * sizeof(float));
+    p->sel_idx_TxK         = ds4_metal_tensor_alloc((uint64_t)Tmax * K * sizeof(int32_t));
+    p->sel_wt_TxK          = ds4_metal_tensor_alloc((uint64_t)Tmax * K * sizeof(float));
+    p->tokens_per_expert_E = ds4_metal_tensor_alloc((uint64_t)E * sizeof(uint32_t));
+    p->ids_buffer_ExT      = ds4_metal_tensor_alloc((uint64_t)E * Tmax * sizeof(int32_t));
+    p->gate_out_TxKxM            = ds4_metal_tensor_alloc((uint64_t)Tmax * K * n_ff_exp * sizeof(float));
+    p->up_out_TxKxM              = ds4_metal_tensor_alloc((uint64_t)Tmax * K * n_ff_exp * sizeof(float));
+    p->mid_TxKxM                 = ds4_metal_tensor_alloc((uint64_t)Tmax * K * n_ff_exp * sizeof(float));
+    p->down_out_TxKxN            = ds4_metal_tensor_alloc((uint64_t)Tmax * K * n_embd * sizeof(float));
+    p->moe_out_TxN         = ds4_metal_tensor_alloc(act_T_bytes);
+    p->shexp_gate_1xF      = ds4_metal_tensor_alloc((uint64_t)n_ff_exp * sizeof(float));
+    p->shexp_up_1xF        = ds4_metal_tensor_alloc((uint64_t)n_ff_exp * sizeof(float));
+    p->shexp_mid_1xF       = ds4_metal_tensor_alloc((uint64_t)n_ff_exp * sizeof(float));
+    p->shexp_out_1xN       = ds4_metal_tensor_alloc((uint64_t)n_embd * sizeof(float));
+
+    if (!p->hidden_TxN || !p->post_attn_TxN || !p->normed_TxN ||
+        !p->router_logits_TxE || !p->sel_idx_TxK || !p->sel_wt_TxK ||
+        !p->tokens_per_expert_E || !p->ids_buffer_ExT ||
+        !p->gate_out_TxKxM || !p->up_out_TxKxM || !p->mid_TxKxM || !p->down_out_TxKxN ||
+        !p->moe_out_TxN ||
+        !p->shexp_gate_1xF || !p->shexp_up_1xF || !p->shexp_mid_1xF || !p->shexp_out_1xN) {
+        fprintf(stderr, "l26f: OOM prefill buffers\n");
+        return NULL;
+    }
+
+    ds4_metal_tensor_fill(p->hidden_TxN, 0.0f);
+    ds4_metal_tensor_fill(p->post_attn_TxN, 0.0f);
+    ds4_metal_tensor_fill(p->moe_out_TxN, 0.0f);
+    return p;
+}
+
+static void l26f_prefill_free(l26f_prefill_compute *p) {
+    if (!p) return;
+    ds4_metal_tensor_free(p->hidden_TxN);
+    ds4_metal_tensor_free(p->post_attn_TxN);
+    ds4_metal_tensor_free(p->normed_TxN);
+    ds4_metal_tensor_free(p->router_logits_TxE);
+    ds4_metal_tensor_free(p->sel_idx_TxK);
+    ds4_metal_tensor_free(p->sel_wt_TxK);
+    ds4_metal_tensor_free(p->tokens_per_expert_E);
+    ds4_metal_tensor_free(p->ids_buffer_ExT);
+    ds4_metal_tensor_free(p->gate_out_TxKxM);
+    ds4_metal_tensor_free(p->up_out_TxKxM);
+    ds4_metal_tensor_free(p->mid_TxKxM);
+    ds4_metal_tensor_free(p->down_out_TxKxN);
+    ds4_metal_tensor_free(p->moe_out_TxN);
+    ds4_metal_tensor_free(p->shexp_gate_1xF);
+    ds4_metal_tensor_free(p->shexp_up_1xF);
+    ds4_metal_tensor_free(p->shexp_mid_1xF);
+    ds4_metal_tensor_free(p->shexp_out_1xN);
+    free(p);
 }
 
 static int l26f_dequant_q8_0_row(const uint8_t *base, uint64_t row_offset,
@@ -1330,18 +2359,23 @@ static int l26f_output_logits(l26f_session *s) {
     l26f_model *m = s->model;
     l26f_tensor *wt_norm_N   = l26f_model_find_tensor(m, "output_norm.weight");
     l26f_tensor *wt_out_NxV  = l26f_model_find_tensor(m, "output.weight");
+    double XPROF_T0 = 0.0;
     if (!wt_norm_N || !wt_out_NxV) {
         fprintf(stderr, "l26f: missing output tensors\n"); return 0;
     }
 
+    if (!XPROF_STANDALONE_BEGIN(&XPROF_T0)) return 0;
     if (!ds4_metal_rms_norm_weight_tensor(s->output_normed_1xN, s->hidden_1xN,
             m->map, m->size, wt_norm_N->abs_offset, m->n_embd, m->rms_norm_eps))
         return 0;
+    if (!XPROF_STANDALONE_END(XPROF_LOGITS_NORM, 999, XPROF_T0)) return 0;
 
+    if (!XPROF_STANDALONE_BEGIN(&XPROF_T0)) return 0;
     if (!l26f_metal_matvec_quant(s->logits_1xV, s->output_normed_1xN,
             m->map, m->size, wt_out_NxV->abs_offset,
             wt_out_NxV->dim[0], wt_out_NxV->dim[1], wt_out_NxV->type, 1))
         return 0;
+    if (!XPROF_STANDALONE_END(XPROF_LOGITS_HEAD, 999, XPROF_T0)) return 0;
 
     return 1;
 }
@@ -1377,17 +2411,18 @@ static int l26f_logit_cmp_desc(const void *a, const void *b) {
 
 static int32_t l26f_sample(l26f_session *s, const l26f_sample_params *p, uint64_t *rng) {
     const uint32_t V = s->model->n_vocab;
+
+    if (p->temperature <= 0.0f) {
+        if (!l26f_metal_argmax(s->sample_idx_1xI, s->logits_1xV, V))
+            return -1;
+        int32_t result = -1;
+        ds4_metal_tensor_read(s->sample_idx_1xI, 0, &result, sizeof(int32_t));
+        return result;
+    }
+
     float *logits = (float *)malloc((uint64_t)V * sizeof(float));
     if (!logits) return -1;
     ds4_metal_tensor_read(s->logits_1xV, 0, logits, (uint64_t)V * sizeof(float));
-
-    if (p->temperature <= 0.0f) {
-        int32_t best = 0;
-        for (uint32_t i = 1; i < V; i++)
-            if (logits[i] > logits[best]) best = (int32_t)i;
-        free(logits);
-        return best;
-    }
 
     for (uint32_t i = 0; i < V; i++) logits[i] /= p->temperature;
 
@@ -1435,128 +2470,361 @@ static int32_t l26f_sample(l26f_session *s, const l26f_sample_params *p, uint64_
     return result;
 }
 
+static int32_t l26f_output_greedy_token(l26f_session *s) {
+    const uint32_t V = s->model->n_vocab;
+    if (!ds4_metal_begin_commands()) return -1;
+    if (!l26f_output_logits(s)) {
+        (void)ds4_metal_end_commands();
+        return -1;
+    }
+    if (!l26f_metal_argmax(s->sample_idx_1xI, s->logits_1xV, V)) {
+        (void)ds4_metal_end_commands();
+        return -1;
+    }
+    if (!ds4_metal_end_commands()) return -1;
+
+    int32_t result = -1;
+    if (!ds4_metal_tensor_read(s->sample_idx_1xI, 0, &result, sizeof(int32_t))) {
+        return -1;
+    }
+    return result;
+}
+
 static int32_t l26f_argmax(l26f_session *s) {
     l26f_sample_params p = {0, 0, 1.0f, 0};
     uint64_t rng = 0;
     return l26f_sample(s, &p, &rng);
 }
 
-static int l26f_forward_pass(l26f_session *session, l26f_model *model, int position, bool verbose) {
-    const uint64_t act_bytes = (uint64_t)model->n_embd * sizeof(float);
+static int l26f_batch_layers(void) {
+    static int initialized = 0;
+    static int layers = 32;
+    if (!initialized) {
+        const char *env = getenv("L26F_BATCH_LAYERS");
+        if (env && env[0]) {
+            int v = atoi(env);
+            if (v > 0 && v < 32) layers = v;
+        }
+        initialized = 1;
+    }
+    return layers;
+}
 
-    if (!ds4_metal_begin_commands()) {
-        fprintf(stderr, "begin_commands failed\n");
+// =========================================================================
+// Prefill forward pass: T tokens through all 32 layers
+// Layer-by-layer: sequential GLA/MLA per token, then batch MoE FFN
+// =========================================================================
+
+static int l26f_forward_pass_prefill(l26f_session *session, l26f_model *model,
+        int32_t *tokens, int n_tokens) {
+    const uint32_t n_embd = model->n_embd;
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
+    l26f_prefill_compute *p = session->prefill;
+    if (!p || (uint32_t)n_tokens > p->max_tokens) {
+        fprintf(stderr, "l26f: prefill not initialized or too many tokens (%d > %u)\n",
+                n_tokens, p ? p->max_tokens : 0);
         return 0;
     }
 
+    L26F_PREFILL_LOG("PREFILL: embedding %d tokens into hidden_TxN", n_tokens);
+    for (int t = 0; t < n_tokens; t++) {
+        if (!l26f_embed_token(session, (uint32_t)tokens[t])) {
+            fprintf(stderr, "l26f: embed failed for prompt token %d\n", tokens[t]);
+            return 0;
+        }
+        float *row_1xN = (float *)malloc(row_bytes);
+        if (!row_1xN) return 0;
+        ds4_metal_tensor_read(session->hidden_1xN, 0, row_1xN, row_bytes);
+        { char _ctx[32]; snprintf(_ctx, sizeof(_ctx), "embed t=%d", t);
+          L26F_NAN_CHECK("embed→hidden_1xN", row_1xN, n_embd, _ctx); }
+        ds4_metal_tensor_write(p->hidden_TxN, (uint64_t)t * row_bytes, row_1xN, row_bytes);
+        free(row_1xN);
+    }
+    L26F_PREFILL_CKPT("hidden_TxN_after_embed", p->hidden_TxN, (uint64_t)n_tokens * row_bytes, 255, -1);
+
     for (uint32_t il = 0; il < 32; il++) {
+        L26F_PREFILL_LOG("PREFILL: layer %u (%s) n_tokens=%d",
+                il, model->is_mla[il] ? "MLA" : "GLA", n_tokens);
+
+        for (int t = 0; t < n_tokens; t++) {
+            float *row_1xN = (float *)malloc(row_bytes);
+            if (!row_1xN) return 0;
+            ds4_metal_tensor_read(p->hidden_TxN, (uint64_t)t * row_bytes, row_1xN, row_bytes);
+            ds4_metal_tensor_write(session->hidden_1xN, 0, row_1xN, row_bytes);
+            free(row_1xN);
+
+            int position = t;
+            ds4_metal_tensor *inp_1xN = session->hidden_1xN;
+            ds4_metal_tensor *out_1xN = session->comp.post_attn_1xN;
+
+            if (model->is_mla[il]) {
+                if (use_gpu_mla()) {
+                    if (!l26f_mla_layer_gpu(model, il, position, session->mla_kv_gpu[il],
+                                              session->mla_comp, inp_1xN, out_1xN)) {
+                        fprintf(stderr, "MLA GPU layer %u token %d failed\n", il, t);
+                        return 0;
+                    }
+                } else {
+                    float *hidden_cpu_1xN = (float *)malloc(row_bytes);
+                    float *hidden_out_1xN = (float *)malloc(row_bytes);
+                    ds4_metal_tensor_read(inp_1xN, 0, hidden_cpu_1xN, row_bytes);
+                    if (!l26f_mla_layer_cpu(model, il, position, session->mla_kv_cpu[il],
+                                              hidden_cpu_1xN, hidden_out_1xN)) {
+                        fprintf(stderr, "MLA CPU layer %u token %d failed\n", il, t);
+                        free(hidden_cpu_1xN); free(hidden_out_1xN);
+                        return 0;
+                    }
+                    ds4_metal_tensor_write(out_1xN, 0, hidden_out_1xN, row_bytes);
+                    free(hidden_cpu_1xN);
+                    free(hidden_out_1xN);
+                }
+            } else {
+                if (!l26f_gla_layer(session, il, position, inp_1xN, out_1xN)) {
+                    fprintf(stderr, "GLA layer %u token %d failed\n", il, t);
+                    return 0;
+                }
+            }
+
+            float *attn_row_1xN = (float *)malloc(row_bytes);
+            if (!attn_row_1xN) return 0;
+            ds4_metal_tensor_read(out_1xN, 0, attn_row_1xN, row_bytes);
+            { char _ctx[32]; snprintf(_ctx, sizeof(_ctx), "L%u:t%d attn_out", il, t);
+              L26F_NAN_CHECK("attn_out_1xN", attn_row_1xN, n_embd, _ctx); }
+            ds4_metal_tensor_write(p->post_attn_TxN, (uint64_t)t * row_bytes,
+                attn_row_1xN, row_bytes);
+            free(attn_row_1xN);
+        }
+
+        if (il == 0) {
+            L26F_PREFILL_LOG("PREFILL: L0 dense_ffn (per-token)");
+            for (int t = 0; t < n_tokens; t++) {
+                float *row_in_1xN = (float *)malloc(row_bytes);
+                if (!row_in_1xN) return 0;
+                ds4_metal_tensor_read(p->post_attn_TxN, (uint64_t)t * row_bytes,
+                    row_in_1xN, row_bytes);
+                ds4_metal_tensor_write(session->comp.post_attn_1xN, 0,
+                    row_in_1xN, row_bytes);
+                free(row_in_1xN);
+
+                if (!l26f_dense_ffn(session, session->comp.post_attn_1xN, session->hidden_1xN)) {
+                    fprintf(stderr, "Dense FFN layer 0 token %d failed\n", t);
+                    return 0;
+                }
+
+                float *row_out_1xN = (float *)malloc(row_bytes);
+                if (!row_out_1xN) return 0;
+                ds4_metal_tensor_read(session->hidden_1xN, 0, row_out_1xN, row_bytes);
+                { char _ctx[32]; snprintf(_ctx, sizeof(_ctx), "L%u:t%d ffn_out", il, t);
+                  L26F_NAN_CHECK("dense_ffn_out", row_out_1xN, n_embd, _ctx); }
+                ds4_metal_tensor_write(p->hidden_TxN, (uint64_t)t * row_bytes,
+                    row_out_1xN, row_bytes);
+                free(row_out_1xN);
+            }
+        } else {
+            L26F_PREFILL_LOG("PREFILL: L%u moe_ffn_batch T=%d", il, n_tokens);
+            L26F_PREFILL_CKPT("pre_moe_post_attn_TxN", p->post_attn_TxN,
+                              (uint64_t)n_tokens * row_bytes, il, -1);
+            if (!l26f_moe_ffn_batch(session, il, p->post_attn_TxN, p->hidden_TxN, n_tokens)) {
+                fprintf(stderr, "Batch MoE FFN layer %u failed\n", il);
+                return 0;
+            }
+            L26F_PREFILL_CKPT("post_moe_hidden_TxN", p->hidden_TxN,
+                              (uint64_t)n_tokens * row_bytes, il, -1);
+        }
+    }
+
+    L26F_PREFILL_LOG("PREFILL: done, copying last token to hidden_1xN");
+    float *last_row_1xN = (float *)malloc(row_bytes);
+    if (!last_row_1xN) return 0;
+    ds4_metal_tensor_read(p->hidden_TxN, (uint64_t)(n_tokens - 1) * row_bytes,
+        last_row_1xN, row_bytes);
+    L26F_NAN_CHECK("final_hidden_1xN", last_row_1xN, n_embd, "final");
+    ds4_metal_tensor_write(session->hidden_1xN, 0, last_row_1xN, row_bytes);
+    free(last_row_1xN);
+
+    return 1;
+}
+
+static int l26f_forward_pass(l26f_session *session, l26f_model *model, int position, bool verbose) {
+    const uint64_t act_bytes = (uint64_t)model->n_embd * sizeof(float);
+    const int batch_layers = l26f_batch_layers();
+    int layers_in_batch = 0;
+
+    if (!ds4_metal_gpu_profile_active()) {
+        if (!ds4_metal_begin_commands()) {
+            fprintf(stderr, "begin_commands failed\n");
+            return 0;
+        }
+    }
+
+    for (uint32_t il = 0; il < 32; il++) {
+        char prof_label[64];
+        snprintf(prof_label, sizeof(prof_label), "L%02u_%s",
+                 il, model->is_mla[il] ? "MLA" : "GLA");
+        ds4_metal_gpu_profile_begin(prof_label);
+
         if (model->is_mla[il]) {
             if (use_gpu_mla()) {
                 ds4_metal_tensor *mla_out_1xN = session->comp.post_attn_1xN;
+                double XPROF_T0 = 0.0;
+                if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
                 if (!l26f_mla_layer_gpu(model, il, position, session->mla_kv_gpu[il],
                                           session->mla_comp, session->hidden_1xN, mla_out_1xN)) {
                     fprintf(stderr, "MLA GPU layer %u failed\n", il);
                     return 0;
                 }
+                if (!XPROF_STAGE_END(XPROF_MLA, il, XPROF_T0)) return 0;
 #ifdef L26F_DBG_COMPARE
                 if ((int)il == l26f_dbg_get_layer()) {
+                    if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
                     if (!l26f_moe_ffn_compare(session, il, mla_out_1xN, session->hidden_1xN)) {
                         fprintf(stderr, "MoE COMPARE layer %u failed\n", il);
                         return 0;
                     }
+                    if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
                 } else
 #elif defined(L26F_DBG_FUSED)
                 if ((int)il == l26f_dbg_get_layer()) {
+                    if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
                     if (!l26f_moe_ffn_fused(session, il, mla_out_1xN, session->hidden_1xN)) {
                         fprintf(stderr, "MoE FUSED layer %u failed\n", il);
                         return 0;
                     }
+                    if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
                 } else
 #endif
-                if (!(l26f_use_fused_moe() ?
-                      l26f_moe_ffn_fused_prod(session, il, mla_out_1xN, session->hidden_1xN) :
-                      l26f_moe_ffn(session, il, mla_out_1xN, session->hidden_1xN))) {
-                    fprintf(stderr, "MoE FFN layer %u failed\n", il);
-                    return 0;
+                {
+                    if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+                    if (!(l26f_use_hybrid_moe() ?
+                          l26f_moe_ffn_hybrid(session, il, mla_out_1xN, session->hidden_1xN) :
+                          (l26f_use_fused_moe() ?
+                           l26f_moe_ffn_fused_prod(session, il, mla_out_1xN, session->hidden_1xN) :
+                           l26f_moe_ffn(session, il, mla_out_1xN, session->hidden_1xN)))) {
+                        fprintf(stderr, "MoE FFN layer %u failed\n", il);
+                        return 0;
+                    }
+                    if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
                 }
             } else {
                 ds4_metal_tensor *out_1xN = session->comp.post_attn_1xN;
                 ds4_metal_end_commands();
-                float *hidden_cpu = (float *)malloc(act_bytes);
-                float *hidden_out = (float *)malloc(act_bytes);
-                ds4_metal_tensor_read(session->hidden_1xN, 0, hidden_cpu, act_bytes);
+                float *hidden_cpu_1xN = (float *)malloc(act_bytes);
+                float *hidden_out_1xN = (float *)malloc(act_bytes);
+                ds4_metal_tensor_read(session->hidden_1xN, 0, hidden_cpu_1xN, act_bytes);
                 if (!l26f_mla_layer_cpu(model, il, position, session->mla_kv_cpu[il],
-                                          hidden_cpu, hidden_out)) {
+                                          hidden_cpu_1xN, hidden_out_1xN)) {
                     fprintf(stderr, "MLA CPU layer %u failed\n", il);
-                    free(hidden_cpu); free(hidden_out);
+                    free(hidden_cpu_1xN); free(hidden_out_1xN);
                     return 0;
                 }
-                ds4_metal_tensor_write(session->hidden_1xN, 0, hidden_out, act_bytes);
-                ds4_metal_tensor_write(out_1xN, 0, hidden_out, act_bytes);
-                free(hidden_cpu);
-                free(hidden_out);
+                ds4_metal_tensor_write(session->hidden_1xN, 0, hidden_out_1xN, act_bytes);
+                ds4_metal_tensor_write(out_1xN, 0, hidden_out_1xN, act_bytes);
+                free(hidden_cpu_1xN);
+                free(hidden_out_1xN);
                 ds4_metal_begin_commands();
+                layers_in_batch = 0;
 #ifdef L26F_DBG_COMPARE
                 if ((int)il == l26f_dbg_get_layer()) {
+                    double XPROF_T0 = 0.0;
+                    if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
                     if (!l26f_moe_ffn_compare(session, il, out_1xN, session->hidden_1xN)) {
                         fprintf(stderr, "MoE COMPARE layer %u failed\n", il);
                         return 0;
                     }
+                    if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
                 } else
 #elif defined(L26F_DBG_FUSED)
                 if ((int)il == l26f_dbg_get_layer()) {
+                    double XPROF_T0 = 0.0;
+                    if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
                     if (!l26f_moe_ffn_fused(session, il, out_1xN, session->hidden_1xN)) {
                         fprintf(stderr, "MoE FUSED layer %u failed\n", il);
                         return 0;
                     }
+                    if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
                 } else
 #endif
-                if (!(l26f_use_fused_moe() ?
-                      l26f_moe_ffn_fused_prod(session, il, out_1xN, session->hidden_1xN) :
-                      l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN))) {
-                    fprintf(stderr, "MoE FFN layer %u failed\n", il);
-                    return 0;
+                {
+                    double XPROF_T0 = 0.0;
+                    if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+                    if (!(l26f_use_hybrid_moe() ?
+                          l26f_moe_ffn_hybrid(session, il, out_1xN, session->hidden_1xN) :
+                          (l26f_use_fused_moe() ?
+                           l26f_moe_ffn_fused_prod(session, il, out_1xN, session->hidden_1xN) :
+                           l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN)))) {
+                        fprintf(stderr, "MoE FFN layer %u failed\n", il);
+                        return 0;
+                    }
+                    if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
                 }
             }
             if (verbose) printf("  layer %u: MLA %s + MoE\n", il, use_gpu_mla() ? "GPU" : "CPU");
+            layers_in_batch++;
+            if (!ds4_metal_gpu_profile_active() && il + 1 < 32 && layers_in_batch >= batch_layers) {
+                if (!ds4_metal_end_commands()) {
+                    fprintf(stderr, "end_commands failed after layer %u\n", il);
+                    return 0;
+                }
+                XREG_PRINT_LAYER_HIDDEN_1xN(il, session->hidden_1xN, act_bytes);
+                if (!ds4_metal_begin_commands()) {
+                    fprintf(stderr, "begin_commands failed after layer %u\n", il);
+                    return 0;
+                }
+                layers_in_batch = 0;
+            }
             continue;
         }
 
         ds4_metal_tensor *inp_1xN = session->hidden_1xN;
         ds4_metal_tensor *out_1xN = session->comp.post_attn_1xN;
 
-        if (!l26f_gla_layer(session, il, inp_1xN, out_1xN)) {
+        double XPROF_T0 = 0.0;
+        if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+        if (!l26f_gla_layer(session, il, position, inp_1xN, out_1xN)) {
             fprintf(stderr, "GLA layer %u failed\n", il);
             return 0;
         }
+        if (!XPROF_STAGE_END(XPROF_GLA, il, XPROF_T0)) return 0;
 
         if (il == 0) {
+            if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
             if (!l26f_dense_ffn(session, out_1xN, session->hidden_1xN)) {
                 fprintf(stderr, "Dense FFN layer 0 failed\n");
                 return 0;
             }
+            if (!XPROF_STAGE_END(XPROF_DENSE, il, XPROF_T0)) return 0;
             if (verbose) printf("  layer %u: GLA + dense FFN\n", il);
         } else {
 #ifdef L26F_DBG_COMPARE
             if ((int)il == l26f_dbg_get_layer()) {
+                if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
                 if (!l26f_moe_ffn_compare(session, il, out_1xN, session->hidden_1xN)) {
                     fprintf(stderr, "MoE COMPARE layer %u failed\n", il);
                     return 0;
                 }
+                if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
             } else
 #elif defined(L26F_DBG_FUSED)
             if ((int)il == l26f_dbg_get_layer()) {
+                if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
                 if (!l26f_moe_ffn_fused(session, il, out_1xN, session->hidden_1xN)) {
                     fprintf(stderr, "MoE FUSED layer %u failed\n", il);
                     return 0;
                 }
+                if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
             } else
 #endif
-            if (!(l26f_use_fused_moe() ?
-                  l26f_moe_ffn_fused_prod(session, il, out_1xN, session->hidden_1xN) :
-                  l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN))) {
-                fprintf(stderr, "MoE FFN layer %u failed\n", il);
-                return 0;
+            {
+                if (!XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+                if (!(l26f_use_hybrid_moe() ?
+                      l26f_moe_ffn_hybrid(session, il, out_1xN, session->hidden_1xN) :
+                      (l26f_use_fused_moe() ?
+                       l26f_moe_ffn_fused_prod(session, il, out_1xN, session->hidden_1xN) :
+                       l26f_moe_ffn(session, il, out_1xN, session->hidden_1xN)))) {
+                    fprintf(stderr, "MoE FFN layer %u failed\n", il);
+                    return 0;
+                }
+                if (!XPROF_STAGE_END(XPROF_MOE, il, XPROF_T0)) return 0;
             }
             if (verbose && il < 8) printf("  layer %u: GLA + MoE\n", il);
         }
@@ -1568,14 +2836,30 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
             float sum = l26f_tensor_checksum(session->hidden_1xN, act_bytes, &nans);
             fprintf(stderr, "LAYER %2u hidden sum=%.4f nans=%d\n", il, sum, nans);
             ds4_metal_begin_commands();
+            layers_in_batch = 0;
         }
 #endif
+
+        layers_in_batch++;
+        if (!ds4_metal_gpu_profile_active() && il + 1 < 32 && layers_in_batch >= batch_layers) {
+            if (!ds4_metal_end_commands()) {
+                fprintf(stderr, "end_commands failed after layer %u\n", il);
+                return 0;
+            }
+            XREG_PRINT_LAYER_HIDDEN_1xN(il, session->hidden_1xN, act_bytes);
+            if (!ds4_metal_begin_commands()) {
+                fprintf(stderr, "begin_commands failed after layer %u\n", il);
+                return 0;
+            }
+            layers_in_batch = 0;
+        }
     }
 
     if (!ds4_metal_end_commands()) {
         fprintf(stderr, "end_commands failed\n");
         return 0;
     }
+    XREG_PRINT_LAYER_HIDDEN_1xN(31, session->hidden_1xN, act_bytes);
     return 1;
 }
 
@@ -1598,26 +2882,26 @@ int main(int argc, char **argv) {
     printf("  vocab: %u tokens, %u merges, BOS=%d EOS=%d\n",
            tok->n_tokens, tok->n_merges, tok->bos_id, tok->eos_id);
 
-    int32_t start_token;
     bool is_text = false;
+    int32_t prompt_tokens[256];
+    int n_prompt = 0;
     if (argc > 2) {
-        // Check if argument is all digits → token ID, else text
         const char *arg = argv[2];
         is_text = false;
         for (int i = 0; arg[i]; i++) {
             if (!isdigit((unsigned char)arg[i]) && arg[i] != '-') { is_text = true; break; }
         }
         if (is_text) {
-            int32_t encoded[256];
-            int n = l26f_text_encode(tok, arg, encoded, 256);
-            if (n == 0) { fprintf(stderr, "Encoding failed\n"); return 1; }
-            start_token = encoded[0];
-            printf("  encoded '%s' → %d tokens, using first: %d\n", arg, n, start_token);
+            n_prompt = l26f_text_encode(tok, arg, prompt_tokens, 256);
+            if (n_prompt == 0) { fprintf(stderr, "Encoding failed\n"); return 1; }
+            printf("  encoded '%s' → %d tokens\n", arg, n_prompt);
         } else {
-            start_token = atoi(argv[2]);
+            prompt_tokens[0] = atoi(argv[2]);
+            n_prompt = 1;
         }
     } else {
-        start_token = 1;
+        prompt_tokens[0] = 1;
+        n_prompt = 1;
     }
     int n_gen = argc > 3 ? atoi(argv[3]) : 16;
 
@@ -1629,17 +2913,17 @@ int main(int argc, char **argv) {
     };
     uint64_t rng = sample_params.seed;
 
-    char tokbuf[256];
-    l26f_token_decode(tok, start_token, tokbuf, sizeof(tokbuf));
-    printf("Starting from token %d (%s), generating %d tokens\n", start_token, tokbuf, n_gen);
-
-    int32_t *generated = (int32_t *)malloc(n_gen * sizeof(int32_t));
-
     printf("Metal init...\n");
     if (!ds4_metal_init()) { fprintf(stderr, "Metal init failed\n"); return 1; }
 
     printf("Model map...\n");
-    if (!ds4_metal_set_model_map(model.map, model.size)) {
+    uint64_t model_tensor_off = 0;
+    uint64_t model_tensor_bytes = model.size;
+    if (!XMODEL_TENSOR_RANGE(&model, &model_tensor_off, &model_tensor_bytes)) {
+        fprintf(stderr, "Model tensor range failed\n"); return 1;
+    }
+    if (!ds4_metal_set_model_map_range(model.map, model.size,
+            model_tensor_off, model_tensor_bytes)) {
         fprintf(stderr, "Model map failed\n"); return 1;
     }
 
@@ -1648,36 +2932,143 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Session init failed\n"); return 1;
     }
 
-    printf("Embedding token %d...\n", start_token);
-    if (!l26f_embed_token(&session, (uint32_t)start_token)) {
-        fprintf(stderr, "Embed failed\n"); return 1;
+    printf("Prefilling %d prompt tokens...\n", n_prompt);
+    if (n_prompt > 1) {
+        session.prefill = l26f_prefill_alloc(model.n_embd, 1024);
+        if (!session.prefill) {
+            fprintf(stderr, "Prefill buffer alloc failed\n"); return 1;
+        }
+        for (int i = 0; i < n_prompt; i++) {
+            char tokbuf_prompt[256];
+            l26f_token_decode(tok, prompt_tokens[i], tokbuf_prompt, sizeof(tokbuf_prompt));
+            printf("  [%d] token %d: \"%s\"\n", i, prompt_tokens[i], tokbuf_prompt);
+        }
+        if (!l26f_forward_pass_prefill(&session, &model, prompt_tokens, n_prompt)) {
+            fprintf(stderr, "Batch prefill failed\n"); return 1;
+        }
+    } else {
+        char tokbuf_prompt[256];
+        l26f_token_decode(tok, prompt_tokens[0], tokbuf_prompt, sizeof(tokbuf_prompt));
+        printf("  [0] token %d: \"%s\"\n", prompt_tokens[0], tokbuf_prompt);
+        if (!l26f_embed_token(&session, (uint32_t)prompt_tokens[0])) {
+            fprintf(stderr, "Embed failed for prompt token %d\n", prompt_tokens[0]);
+            return 1;
+        }
+        if (!l26f_forward_pass(&session, &model, 0, false)) {
+            fprintf(stderr, "Forward pass failed for prompt token %d\n", prompt_tokens[0]);
+            return 1;
+        }
     }
 
-    printf("Generating %d tokens from token %d (temp=%.2f, top_k=%d, top_p=%.2f)...\n",
-           n_gen, start_token, sample_params.temperature, sample_params.top_k, sample_params.top_p);
-    int32_t current_token = start_token;
-    int n_generated = 0;
+    printf("Generating %d tokens (temp=%.2f, top_k=%d, top_p=%.2f)...\n",
+           n_gen, sample_params.temperature, sample_params.top_k, sample_params.top_p);
+    int32_t current_token;
+    {
+        double XPROF_T0 = 0.0;
+        if (sample_params.temperature <= 0.0f && !XPROF_ENABLED()) {
+            current_token = l26f_output_greedy_token(&session);
+        } else {
+            if (!l26f_output_logits(&session)) {
+                fprintf(stderr, "Output projection failed\n"); return 1;
+            }
+            if (!XPROF_STANDALONE_BEGIN(&XPROF_T0)) return 1;
+            current_token = l26f_sample(&session, &sample_params, &rng);
+            if (!XPROF_STANDALONE_END(XPROF_SAMPLE, 999, XPROF_T0)) return 1;
+        }
+        if (current_token < 0) {
+            fprintf(stderr, "Sample failed\n"); return 1;
+        }
+    }
+    char tokbuf[256];
+    l26f_token_decode(tok, current_token, tokbuf, sizeof(tokbuf));
+    printf("  -> token %d: \"%s\"\n", current_token, tokbuf);
+
+    int32_t *generated = (int32_t *)malloc((n_gen + 1) * sizeof(int32_t));
+    generated[0] = current_token;
+    int n_generated = 1;
+
+    int gpu_trace_gen = -1;
+    char gpu_trace_path[1024] = {0};
+    {
+        const char *env = getenv("L26F_GPU_TRACE");
+        if (env) {
+            const char *colon = strchr(env, ':');
+            if (colon) {
+                gpu_trace_gen = atoi(env);
+                size_t plen = strlen(colon + 1);
+                if (plen >= sizeof(gpu_trace_path)) plen = sizeof(gpu_trace_path) - 1;
+                memcpy(gpu_trace_path, colon + 1, plen);
+                gpu_trace_path[plen] = '\0';
+                fprintf(stderr, "GPU trace: will capture gen=%d -> %s\n", gpu_trace_gen, gpu_trace_path);
+            } else {
+                fprintf(stderr, "L26F_GPU_TRACE format: gen_index:/path/to/capture.gputrace\n");
+            }
+        }
+    }
+
+    int gpu_profile_gen = -1;
+    {
+        const char *env = getenv("L26F_GPU_PROFILE");
+        if (env) {
+            gpu_profile_gen = atoi(env);
+            fprintf(stderr, "GPU profile: will profile gen=%d\n", gpu_profile_gen);
+        }
+    }
+
     struct timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     for (int gen = 0; gen < n_gen; gen++) {
-        printf("\n--- Token %d (input=%d) ---\n", gen, current_token);
+        if (gen == gpu_trace_gen && gpu_trace_path[0]) {
+            if (!ds4_metal_start_capture(gpu_trace_path)) {
+                fprintf(stderr, "GPU trace start failed\n");
+            }
+        }
+        if (gen == gpu_profile_gen) {
+            ds4_metal_gpu_profile_init();
+        }
 
-        bool verbose = (gen < 2);
-        if (!l26f_forward_pass(&session, &model, gen, verbose)) {
+        if (!l26f_embed_token(&session, (uint32_t)current_token)) {
+            fprintf(stderr, "Embed failed for token %d\n", current_token);
+            return 1;
+        }
+
+        if (!l26f_forward_pass(&session, &model, n_prompt + gen, false)) {
             fprintf(stderr, "Forward pass %d failed\n", gen);
             return 1;
         }
 
-        if (!l26f_output_logits(&session)) {
-            fprintf(stderr, "Output projection failed\n"); return 1;
+        double XPROF_T0 = 0.0;
+        int32_t next_token;
+        if (sample_params.temperature <= 0.0f && !XPROF_ENABLED()) {
+            next_token = l26f_output_greedy_token(&session);
+        } else {
+            if (!l26f_output_logits(&session)) {
+                fprintf(stderr, "Output projection failed\n"); return 1;
+            }
+
+            if (!XPROF_STANDALONE_BEGIN(&XPROF_T0)) return 1;
+            next_token = l26f_sample(&session, &sample_params, &rng);
+            if (!XPROF_STANDALONE_END(XPROF_SAMPLE, 999, XPROF_T0)) return 1;
+        }
+        if (next_token < 0) {
+            fprintf(stderr, "Sample failed\n"); return 1;
         }
 
-        int32_t next_token = l26f_sample(&session, &sample_params, &rng);
+        if (gen == gpu_profile_gen) {
+            ds4_metal_gpu_profile_print();
+        }
+
         l26f_token_decode(tok, next_token, tokbuf, sizeof(tokbuf));
         printf("  -> token %d: \"%s\"\n", next_token, tokbuf);
-        generated[gen] = next_token;
-        n_generated = gen + 1;
+        generated[n_generated++] = next_token;
+
+        if (gen == gpu_trace_gen && gpu_trace_path[0]) {
+            if (!ds4_metal_stop_capture()) {
+                fprintf(stderr, "GPU trace stop failed\n");
+            }
+            gpu_trace_path[0] = '\0';
+        }
 
         if (next_token == tok->eos_id) {
             printf("  (EOS reached)\n");
@@ -1685,27 +3076,26 @@ int main(int argc, char **argv) {
         }
 
         current_token = next_token;
-
-        if (gen + 1 < n_gen) {
-            if (!l26f_embed_token(&session, (uint32_t)current_token)) {
-                fprintf(stderr, "Embed failed for token %d\n", current_token);
-                return 1;
-            }
-        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t_end);
     double elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
     printf("\nFull text: ");
-    l26f_text_decode(tok, generated, n_generated, tokbuf, sizeof(tokbuf));
+    int32_t *all_tokens = (int32_t *)malloc((n_prompt + n_generated) * sizeof(int32_t));
+    memcpy(all_tokens, prompt_tokens, n_prompt * sizeof(int32_t));
+    memcpy(all_tokens + n_prompt, generated, n_generated * sizeof(int32_t));
+    l26f_text_decode(tok, all_tokens, n_prompt + n_generated, tokbuf, sizeof(tokbuf));
     printf("%s\n", tokbuf);
-    printf("\n%d tokens in %.3fs (%.1f tok/s)\n", n_generated, elapsed,
+    printf("\n%d prompt + %d generated tokens\n", n_prompt, n_generated);
+    printf("Decode: %d tokens in %.3fs (%.1f tok/s)\n", n_generated, elapsed,
            n_generated > 0 ? (double)n_generated / elapsed : 0.0);
 
+    l26f_prefill_free(session.prefill);
     l26f_session_free(&session);
     ds4_metal_cleanup();
     l26f_model_close(&model);
     l26f_tokenizer_close(tok);
     free(generated);
+    free(all_tokens);
     return 0;
 }

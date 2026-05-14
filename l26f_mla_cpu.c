@@ -3,7 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <math.h>
+#include <inttypes.h>
 #include "l26f.h"
 
 // Debug checksum helper

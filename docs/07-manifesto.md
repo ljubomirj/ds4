@@ -238,3 +238,65 @@ This is far more diagnostic than just `sum`. The `nans` count catches NaN. The
 `min`/`max` catch explosions. The quantiles catch distributional shifts. We already
 have `sum`/`min`/`max`/`nans` — adding percentiles is a small effort for large
 diagnostic gain.
+
+---
+
+## 13. Data debugging
+1. Piping is useful for running things in parallel, especially with the multi-core machines we all use nowadays. Pipes provide the simplest dependency graph, and they have automatic IPC synchronization courtesy of the pipes FIFO-s flowing from one process to the next. That allows for individual processes in the pipeline to be run independently on different cores with the data flowing between allowing them to keep busy and not stall waiting.
+2. Drawback of data flowing through the pipelines is that data flow is invisible to us and no record remains of the data available for inspection and debugging. Replacing a pipe "|" with "| tee tempfile |" allows for subsequent inspection of the "tempfile" to see what the data looked like.
+   Example - debug:
+```
+     $ for a in {1..10}; do echo $a; done | wc -l
+```
+   as
+```
+     $ for a in {1..10}; do echo $a; done | tee tempfile | wc -l
+     $ cat tempfile
+```
+3. Vectorised processing via numpy or in languages like matlab or array languages where the default data type is not a scalar (but an array or Ndim array in general) makes peeking into the individual values being aggregated or processed hard and needing extra effort.
+  * Use hardware support for NaN to your advantage to prevent accidently using missing data. Convert missing data on input into NaN in memory where possible (data is float or double). Any operation with a NaN will result in a NaN, so it will be detected in the end.
+  * If possible structure processing in the form of apply(function,array) so to use a kernel function that data will flow through. Then insert logging inside it to inspect data flowing through, turn it on/off where insight/speed is needed.
+4. Use any data invariants to your advantage. Add asserts liberally to catch data breaking invariants as early as possible. If possible designate not-a-value for other types (analogous to NaN for floats) where possible, even if the hardware support is lacking: 0 for indices (assuming 1-based), INT_MIN as INT_NAN for integers, nullprt for pointers.
+5. This book has been useful to me for coding, but lessons apply to data too - "Writing Solid Code" by Steve Maguire.
+6. Data is used to run experiemnts, and experiments *must* be reproducable (b/c - science!). So:
+  * Any external data source used (and thus outside our control) must be cached.
+  * It must be possible to run the whole experiment without touching any external data source, only using cached data - so any run is reproducable.
+  * Often it's possbile to leverage binary native de/serialization capabilities with a bit of care and prologue/epilogue code blocks.
+    Example - python:
+```
+       name = cache_name()
+       try:
+           with open(name, 'rb') as f: st = pickle.load(f)
+       except IOError:
+           st = fetch_from_external_source()
+           ... (maybe reprocessing cleaning) ...
+           with open(name, 'wb') as f: pickle.dump(st, f)
+```
+    Example - matlab:
+```
+       name = cache_name();
+       st = load_struct_from_mat(name);
+       if isempty(st)
+         st = fetch_from_external_source();
+         ... (maybe preprocessing, cleaining) ...
+         save_struct_to_mat(name, st);
+       end
+```
+7. Version data: where possible/space allowing, and often where the data is ASCII (e.g. .csv or .tsv files) - add it straight to a git repository.
+8. Version data: where not possible b/c too much space - version the binary blobs outside a repository using the filesystem.
+9. Keep ASCII files (.csv, .tsv) on disk compressed in a streaming-friendly format, not only to (a) save space, but also to ensure (b) integrity via checksuming, and possibly (c) speed up reading.
+10. Use formats like .zstd and .gz that are append and rsync friendly, e.g. where
+```
+    if $ zstd -c file1 >file.zst; zstd -c file2 >>file.zst, then $ diff <(zstd -dc file.zst) <(cat file{1,2})
+```
+  produces no diffs.
+11. Use --rsyncable in gzip and zstd (NB bzip2 lacks that) to create rsync-friendly compressed file.
+12. If keeping ASCII data compressed (e.g. .csv.zst) in git can enable comfortable diffing -
+    in .gitattributes add:
+```
+      *.csv.zst diff=csv.zst
+    while in .gitconfig add:
+      [diff "csv.zst"]
+      textconv = zstdcat
+```
+

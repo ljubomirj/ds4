@@ -1,16 +1,19 @@
 // l26f: GGUF model loader
 // Adapted from ds4.c's GGUF parser
 
-#include "l26f.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <inttypes.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+
+#include "l26f.h"
 
 // ---- Cursor operations ----
 

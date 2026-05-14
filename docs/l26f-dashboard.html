@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>l26f — Ling-2.6-flash Metal Engine</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, 'SF Mono', 'Menlo', monospace; background: #0a0a0a; color: #c8c8c8; font-size: 13px; line-height: 1.5; }
+a { color: #6cb6ff; text-decoration: none; }
+.container { max-width: 1400px; margin: 0 auto; padding: 16px; }
+h1 { color: #fff; font-size: 22px; margin-bottom: 4px; }
+.subtitle { color: #888; margin-bottom: 16px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+.card { background: #141414; border: 1px solid #2a2a2a; border-radius: 6px; padding: 12px; }
+.card h2 { color: #e0e0e0; font-size: 13px; font-weight: 600; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+.card h3 { color: #aaa; font-size: 12px; font-weight: 600; margin: 8px 0 4px; }
+.card.wide { grid-column: 1 / -1; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: #888; font-weight: 500; padding: 3px 6px; border-bottom: 1px solid #2a2a2a; }
+td { padding: 3px 6px; border-bottom: 1px solid #1a1a1a; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.highlight { color: #4ec9b0; font-weight: 600; }
+.warn { color: #d4a853; }
+.good { color: #6a9955; }
+.speed-bar { height: 6px; background: #1a1a1a; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+.speed-fill { height: 100%; border-radius: 3px; }
+.perf-grid { display: grid; grid-template-columns: 60px 1fr 60px; gap: 4px 8px; align-items: center; margin-bottom: 8px; }
+.perf-label { color: #888; font-size: 11px; }
+.perf-tok { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.flow-step { display: flex; gap: 8px; margin-bottom: 4px; align-items: baseline; }
+.flow-num { color: #4ec9b0; font-weight: 600; min-width: 20px; }
+.flow-name { color: #e0e0e0; font-weight: 600; min-width: 140px; }
+.flow-desc { color: #888; }
+.flow-kernels { color: #6a9955; font-size: 11px; }
+.dim-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 4px; }
+.dim-item { background: #1a1a1a; border-radius: 4px; padding: 4px 8px; text-align: center; }
+.dim-label { font-size: 10px; color: #888; }
+.dim-value { font-size: 14px; color: #e0e0e0; font-weight: 600; }
+.restart-box { background: #1a1a14; border: 1px solid #4a4a2a; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+.restart-box h2 { color: #d4a853; }
+.code-path { background: #1a1a1a; padding: 6px 8px; border-radius: 4px; font-size: 11px; margin: 4px 0; color: #6a9955; word-break: break-all; }
+.insight { padding: 4px 0; color: #c8c8c8; }
+.insight::before { content: "→ "; color: #6cb6ff; }
+@media (max-width: 900px) { .grid, .grid3 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>l26f</h1>
+<div class="subtitle">Narrow Metal inference engine for Ling-2.6-flash (104B MoE, 7.4B active) — <span id="tok-s">21.8</span> tok/s</div>
+
+<!-- Performance -->
+<div class="grid3">
+<div class="card">
+<h2>Speed Progression</h2>
+<table>
+<thead><tr><th>Step</th><th class="num">tok/s</th><th class="num">Gain</th></tr></thead>
+<tbody id="perf-tbody"></tbody>
+</table>
+</div>
+
+<div class="card">
+<h2>Current vs r2</h2>
+<div style="margin-bottom:8px">
+<span class="perf-label">l26f</span>
+<div class="speed-bar"><div class="speed-fill" id="bar-l26f" style="width:64%;background:#4ec9b0"></div></div>
+<span class="perf-tok highlight" id="bar-l26f-label">21.8 tok/s</span>
+</div>
+<div>
+<span class="perf-label">r2 ref</span>
+<div class="speed-bar"><div class="speed-fill" style="width:100%;background:#6a9955"></div></div>
+<span class="perf-tok good">34.0 tok/s</span>
+</div>
+<div style="margin-top:12px;color:#888;font-size:11px">Gap: <span class="warn">1.56x</span> — MoE expert path (~30ms of ~46ms/tok)</div>
+</div>
+
+<div class="card">
+<h2>Timing Breakdown (per token)</h2>
+<table>
+<thead><tr><th>Stage</th><th class="num">ms</th><th class="num">%</th></tr></thead>
+<tbody>
+<tr><td>GLA (28 layers)</td><td class="num">12.0</td><td class="num">26%</td></tr>
+<tr><td>MoE (31 layers)</td><td class="num highlight">30.0</td><td class="num highlight">65%</td></tr>
+<tr><td>MLA (4 layers)</td><td class="num">4.0</td><td class="num">9%</td></tr>
+<tr><td>Logits</td><td class="num">1.2</td><td class="num">3%</td></tr>
+<tr><td>Other</td><td class="num">1.0</td><td class="num">2%</td></tr>
+<tr style="border-top:1px solid #4a4a4a"><td style="font-weight:600">Total</td><td class="num" style="font-weight:600">48.2</td><td class="num">—</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- Architecture -->
+<div class="grid">
+<div class="card">
+<h2>Model Architecture</h2>
+<div class="dim-grid" id="dims-grid"></div>
+<div style="margin-top:8px;font-size:11px;color:#888">
+<div style="margin-bottom:4px">32 layers: 28 GLA + 4 MLA (layers 7,15,23,31)</div>
+<div>Each layer: Attention → MoE FFN (8/256 experts + shared expert)</div>
+<div>Quantization: IQ4_NL (attention, gate/up) + Q5_K (MoE down) + Q6_K (output logits)</div>
+</div>
+</div>
+
+<div class="card">
+<h2>File Map</h2>
+<table>
+<thead><tr><th>File</th><th>Lines</th><th>Role</th></tr></thead>
+<tbody id="files-tbody"></tbody>
+</table>
+</div>
+</div>
+
+<!-- Forward Pass -->
+<div class="card wide">
+<h2>Forward Pass Flow (per token)</h2>
+<div id="flow-container"></div>
+</div>
+
+<!-- Metal Infrastructure -->
+<div class="grid">
+<div class="card">
+<h2>Metal Compilation</h2>
+<div style="margin-bottom:8px;font-size:12px">All <code>.metal</code> files concatenated into one <code>MTLLibrary</code>. Load order matters — later files see definitions from earlier ones.</div>
+<h3>Preamble (from ds4_metal.m)</h3>
+<div style="font-size:11px;color:#6a9955">FOR_UNROLL, block_iq4_nl, block_q5_K, block_q6_K, kvalues_iq4nl_f, N_SIMDWIDTH</div>
+<h3>Key defines by file</h3>
+<table>
+<thead><tr><th>File</th><th>Defines</th></tr></thead>
+<tbody>
+<tr><td>dense.metal</td><td style="color:#6a9955">ds4_metal_args_mul_mv (struct)</td></tr>
+<tr><td>moe.metal</td><td style="color:#6a9955">QK_K=256, block_q2_K, block_q4_K, get_scale_min_k4_just2</td></tr>
+<tr><td>l26f_dense.metal</td><td style="color:#6a9955">includes #ifndef QK_K guard</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="card">
+<h2>Command Buffer Batching</h2>
+<div style="font-size:12px;margin-bottom:8px">One command buffer for all 32 layers. All kernel dispatches append to same encoder via <code>g_batch_cb</code> / <code>g_batch_enc</code>.</div>
+<table>
+<thead><tr><th>Function</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>begin_commands</code></td><td>Create batch CB, set g_batch_cb</td></tr>
+<tr><td><code>command_buffer</code></td><td>Return g_batch_cb (owned=0)</td></tr>
+<tr><td><code>compute_encoder</code></td><td>Reuse g_batch_enc if active</td></tr>
+<tr><td><code>end_compute_encoder</code></td><td>No-op in batch mode</td></tr>
+<tr><td><code>finish_command_buffer</code></td><td>Immediate return if owned=0</td></tr>
+<tr><td><code>end_commands</code></td><td>Close encoder, commit, wait</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+
+<!-- Restart Context -->
+<div class="restart-box card wide">
+<h2>Restart Context — What to Do Next</h2>
+
+<h3>Next Task: Port kernel_mul_mm_id (mat-mat with expert index) for MoE</h3>
+<div style="font-size:12px;margin-bottom:8px;color:#888">
+r2 uses <code>kernel_mul_mm_id</code> with <code>simdgroup_half8x8</code> (64×32 tile SGEMM) instead of per-expert mat-vec.
+This wins for prefill (batch &gt; 1) and speculative decoding. For single-token decode, both r2 and l26f use mat-vec.
+</div>
+
+<h3>Where the code lives</h3>
+<div class="code-path">r2 mat-mat kernel: metal/l26f_ref_r2.metal ~line 9843 (template kernel_mul_mm_id)</div>
+<div class="code-path">r2 map0 kernel: metal/l26f_ref_r2.metal ~line 9777 (kernel_mul_mm_id_map0)</div>
+<div class="code-path">r2 args struct: metal/l26f_ref_r2_impl.h line 507 (ggml_metal_kargs_mul_mm_id)</div>
+<div class="code-path">Current MoE driver: test_l26f_multilayer.c:1041 (l26f_moe_ffn_fused_prod)</div>
+<div class="code-path">Current IQ4_NL fused: metal/l26f_dense.metal:580</div>
+<div class="code-path">Current Q5_K fused: metal/l26f_dense.metal:864</div>
+<div class="code-path">IQ4_NL dispatch: l26f_metal.m:15959 (l26f_metal_fused_moe_iq4nl)</div>
+<div class="code-path">Q5_K dispatch: l26f_metal.m:16006 (l26f_metal_fused_moe_q5k)</div>
+
+<h3>Key insights for restarting</h3>
+<div class="insight">kernel_mul_mm_id uses simdgroup_half8x8 with 64×32 output tiles, 4 SIMD groups, 128 threads per threadgroup, 8KB threadgroup memory</div>
+<div class="insight">For single-token decode mat-vec is optimal. mat-mat wins when batch ≥ 32 tokens share an expert</div>
+<div class="insight">The 1.56x decode gap is kernel quality + dispatch efficiency, not mat-vec vs mat-mat</div>
+<div class="insight">Use <code>ds4_metal_args_mul_mv</code> (from dense.metal) as the Metal-side struct — NOT <code>ds4_metal_q8_0_matvec_args</code> (host-only)</div>
+<div class="insight">Add <code>#ifndef QK_K / #define QK_K 256 / #endif</code> guard in l26f_dense.metal for cross-file macro safety</div>
+<div class="insight">The MoE weight tensors (ffn_gate_exps, etc.) are stored contiguously as 3D [256, out_dim, in_dim] — nb02 stride works directly</div>
+
+<h3>Correctness check</h3>
+<div class="code-path">L26F_FUSED_MOE=1 ./test_l26f_multilayer ~/llama.cpp/models/Ling-2.6-flash-IQ4_NL-quality-bailing_hybrid-20260508-LJ.gguf 1 16 0</div>
+<div style="font-size:12px;color:#888">First 5 tokens must be: <span class="highlight">1 → 126887 → 34661 → 1 → 96</span></div>
+</div>
+
+<!-- Build & Run -->
+<div class="card wide" style="margin-bottom:12px">
+<h2>Build & Run</h2>
+<table>
+<tbody>
+<tr><td style="color:#888;width:120px">Build</td><td><code>make clean && make test_l26f_multilayer</code></td></tr>
+<tr><td style="color:#888">Benchmark</td><td><code>L26F_FUSED_MOE=1 ./test_l26f_multilayer &lt;model&gt; 1 64 0</code></td></tr>
+<tr><td style="color:#888">Profile</td><td><code>L26F_FUSED_MOE=1 L26F_PROFILE=1 L26F_PROFILE_SYNC=1 ./test_l26f_multilayer &lt;model&gt; 1 8 0</code></td></tr>
+<tr><td style="color:#888">Dependencies</td><td>None — Metal framework only, no external libs</td></tr>
+</tbody>
+</table>
+</div>
+
+<div style="text-align:center;color:#444;font-size:11px;padding:8px">
+Generated from <a href="l26f-state.json">l26f-state.json</a> — <span id="timestamp"></span>
+</div>
+
+</div>
+
+<script>
+const d = {
+  "project": "l26f-private",
+  "description": "Narrow Metal inference engine for Ling-2.6-flash (104B MoE, 7.4B active)",
+  "model_file": "Ling-2.6-flash-IQ4_NL-quality-bailing_hybrid-20260508-LJ.gguf",
+  "model_size_gib": 57.56,
+  "branch": "l26f-private",
+  "source_dir": "/Users/ljubomir/llama.cpp/contrib/ds4/worktrees/l26f-private",
+  "r2_reference": "/Users/ljubomir/llama.cpp/worktrees/LJ-Ling-2.6-flash-r2",
+  "performance": {
+    "current_tok_s": 21.8,
+    "r2_reference_tok_s": 34.0,
+    "gap_factor": 1.56,
+    "history": [
+      {
+        "step": "Per-expert MoE (starting point)",
+        "tok_s": 5.4
+      },
+      {
+        "step": "+ Fused MoE (zero CB breaks)",
+        "tok_s": 7.1
+      },
+      {
+        "step": "+ SIMD MLA v2",
+        "tok_s": 7.9
+      },
+      {
+        "step": "+ SIMD Q6_K output logits",
+        "tok_s": 20.0
+      },
+      {
+        "step": "+ SIMD Q5_K + fused MoE Q5_K",
+        "tok_s": 21.8
+      }
+    ]
+  },
+  "dimensions": {
+    "N": 4096,
+    "S": 128,
+    "V": 157184,
+    "H": 32,
+    "D": 192,
+    "P": 128,
+    "Q": 1536,
+    "C": 512,
+    "R": 64,
+    "CR": 576,
+    "E": 256,
+    "K": 8,
+    "G": 8,
+    "M": 1024,
+    "F": 4096
+  },
+  "architecture": {
+    "total_layers": 32,
+    "layer_0": "Dense FFN (GLA + dense)",
+    "layers_1_to_6": "GLA + MoE FFN",
+    "layer_7": "MLA + MoE FFN",
+    "layers_8_to_14": "GLA + MoE FFN",
+    "layer_15": "MLA + MoE FFN",
+    "layers_16_to_22": "GLA + MoE FFN",
+    "layer_23": "MLA + MoE FFN",
+    "layers_24_to_30": "GLA + MoE FFN",
+    "layer_31": "MLA + MoE FFN",
+    "gla_layers": 28,
+    "mla_layers": 4
+  },
+  "files": [
+    {
+      "path": "l26f.h",
+      "lines": 135,
+      "role": "Model struct, type table, block structs, dimensions"
+    },
+    {
+      "path": "l26f.c",
+      "lines": 8,
+      "role": "Empty (all logic in gguf/gguf.c and test driver)"
+    },
+    {
+      "path": "l26f_gguf.c",
+      "lines": 540,
+      "role": "GGUF mmap loader: 540 tensors, metadata, tensor offset table"
+    },
+    {
+      "path": "l26f_metal.h",
+      "lines": 387,
+      "role": "Metal dispatch declarations, tensor alloc/session init"
+    },
+    {
+      "path": "l26f_metal.m",
+      "lines": 16298,
+      "role": "Metal runtime: device/queue/library, all kernel dispatch, model views"
+    },
+    {
+      "path": "l26f_mla_cpu.c",
+      "lines": 600,
+      "role": "CPU-only MLA decode (fallback, correctness reference)"
+    },
+    {
+      "path": "l26f_mla_gpu.c",
+      "lines": 500,
+      "role": "GPU MLA decode: absorption, flash_attn_ext, RoPE"
+    },
+    {
+      "path": "l26f_tokenizer.c",
+      "lines": 400,
+      "role": "BPE tokenizer: vocab + merges from model mmap"
+    },
+    {
+      "path": "test_l26f_multilayer.c",
+      "lines": 2306,
+      "role": "Main driver: 32-layer forward pass, MoE, profiling, text gen"
+    },
+    {
+      "path": "ds4_metal.m",
+      "lines": 14535,
+      "role": "Shared Metal runtime (ds4 origin): command batching, tensor ops, views"
+    },
+    {
+      "path": "ds4_metal.h",
+      "lines": 789,
+      "role": "Shared Metal API declarations"
+    },
+    {
+      "path": "metal/l26f_dense.metal",
+      "lines": 1067,
+      "role": "IQ4_NL/Q5_K/Q6_K SIMD matvec + fused MoE kernels"
+    },
+    {
+      "path": "metal/l26f_gla.metal",
+      "lines": 327,
+      "role": "GLA recurrent attention kernel (state update + output)"
+    },
+    {
+      "path": "metal/l26f_mla.metal",
+      "lines": 376,
+      "role": "MLA GPU attention kernels (flash attn for MQA)"
+    },
+    {
+      "path": "metal/l26f_norm.metal",
+      "lines": 97,
+      "role": "Group norm kernel for GLA output"
+    },
+    {
+      "path": "metal/l26f_argmax.metal",
+      "lines": 72,
+      "role": "GPU argmax for greedy sampling"
+    },
+    {
+      "path": "metal/l26f_gdn.metal",
+      "lines": 140,
+      "role": "GDN (Gated Delta Net) skeleton for future use"
+    },
+    {
+      "path": "metal/l26f_ref_r2.metal",
+      "lines": 10752,
+      "role": "Full r2 Metal source for scavenging (not compiled)"
+    },
+    {
+      "path": "metal/l26f_ref_r2_impl.h",
+      "lines": 540,
+      "role": "r2 kernel args structs and constants (reference)"
+    },
+    {
+      "path": "metal/l26f_ref_r2_common.h",
+      "lines": 360,
+      "role": "r2 quantization block types (reference)"
+    },
+    {
+      "path": "metal/moe.metal",
+      "lines": 1737,
+      "role": "ds4 MoE kernels (Q2_K/Q4_K/IQ2_XXS), block structs, QK_K def"
+    },
+    {
+      "path": "metal/dense.metal",
+      "lines": 1121,
+      "role": "ds4 Q8_0/F16/F32 matvec, mul_mv template, args_mul_mv struct"
+    },
+    {
+      "path": "OLD/l26f_ref_r2_bailing_hybrid.cpp",
+      "lines": 867,
+      "role": "r2 model implementation (reference)"
+    }
+  ],
+  "forward_pass": {
+    "entry": "l26f_forward_pass() in test_l26f_multilayer.c:1949",
+    "command_buffer_strategy": "One CB for all 32 layers (L26F_BATCH_LAYERS=32 default)",
+    "per_token_flow": [
+      {
+        "step": 1,
+        "name": "Embedding lookup",
+        "desc": "token_id -> hidden_1xN (4096 floats)"
+      },
+      {
+        "step": 2,
+        "name": "GLA layer (28x)",
+        "desc": "RMS norm -> QKV matvec (IQ4_NL) -> gate matvec -> Q/K norm+RoPE -> GLA recurrent -> epilogue -> output proj -> residual",
+        "kernels": [
+          "kernel_rms_norm_weight_tensor",
+          "kernel_mul_mv_iq4_nl_f32",
+          "kernel_l26f_gla_qk_norm_rope",
+          "kernel_l26f_gla",
+          "kernel_l26f_gla_epilogue",
+          "kernel_add"
+        ]
+      },
+      {
+        "step": 3,
+        "name": "MLA layer (4x)",
+        "desc": "wq_a -> norm -> wq_b -> wkv_a -> norm -> wk_b absorb -> wv_b -> RoPE -> flash_attn_ext -> wo proj -> residual",
+        "kernels": [
+          "kernel_rms_norm_weight_tensor",
+          "kernel_mul_mv_iq4_nl_f32",
+          "kernel_flash_attn_ext"
+        ]
+      },
+      {
+        "step": 4,
+        "name": "Dense FFN (layer 0)",
+        "desc": "RMS norm -> gate matvec -> up matvec -> SwiGLU -> down matvec -> residual",
+        "kernels": [
+          "kernel_rms_norm_weight_tensor",
+          "kernel_mul_mv_iq4_nl_f32",
+          "kernel_swiglu"
+        ]
+      },
+      {
+        "step": 5,
+        "name": "MoE FFN (31x)",
+        "desc": "RMS norm -> router (F32 matvec) -> softmax+topk -> gather offsets -> fused gate+up (IQ4_NL) -> SwiGLU -> fused down (Q5_K) -> shared expert (3 matvecs) -> weighted accumulate -> residual",
+        "kernels": [
+          "kernel_rms_norm_weight_tensor",
+          "kernel_matmul_f32",
+          "kernel_l26f_moe_route",
+          "kernel_l26f_gather_offsets_3",
+          "kernel_l26f_fused_moe_iq4nl_gate_up",
+          "kernel_l26f_fused_swiglu",
+          "kernel_l26f_fused_moe_q5k",
+          "kernel_l26f_axpy",
+          "kernel_l26f_fused_accum"
+        ]
+      },
+      {
+        "step": 6,
+        "name": "Output logits",
+        "desc": "RMS norm -> output matvec (Q6_K 4096x157184) -> argmax",
+        "kernels": [
+          "kernel_rms_norm_weight_tensor",
+          "kernel_mul_mv_q6_K_f32",
+          "kernel_l26f_argmax"
+        ]
+      }
+    ]
+  },
+  "metal_compilation": {
+    "method": "All .metal files concatenated into one MTLLibrary",
+    "load_order": "ds4_metal_source preamble (base defines, block structs) + all required_sources in order",
+    "preamble_includes": [
+      "FOR_UNROLL pragma",
+      "block_iq4_nl",
+      "block_q5_K",
+      "block_q6_K",
+      "kvalues_iq4nl_f"
+    ],
+    "metal_files_in_order": [
+      "flash_attn.metal",
+      "dense.metal (defines ds4_metal_args_mul_mv)",
+      "moe.metal (defines QK_K, block_q2_K, block_q4_K)",
+      "dsv4_hc.metal",
+      "unary.metal",
+      "dsv4_kv.metal",
+      "dsv4_rope.metal",
+      "dsv4_misc.metal",
+      "argsort.metal",
+      "cpy.metal",
+      "concat.metal",
+      "get_rows.metal",
+      "repeat.metal",
+      "sum_rows.metal",
+      "softmax.metal",
+      "glu.metal",
+      "norm.metal",
+      "bin.metal",
+      "set_rows.metal",
+      "l26f_dense.metal (needs QK_K, ds4_metal_args_mul_mv)",
+      "l26f_gla.metal",
+      "l26f_mla.metal",
+      "l26f_gdn.metal",
+      "l26f_argmax.metal",
+      "l26f_norm.metal"
+    ]
+  },
+  "command_buffer_batching": {
+    "mechanism": "ds4_metal_begin_commands() sets g_batch_cb; all kernel dispatches append to same encoder",
+    "key_functions": {
+      "ds4_metal_begin_commands": "Create batch CB, set g_batch_cb",
+      "ds4_metal_command_buffer": "Return g_batch_cb if active, else new CB",
+      "ds4_metal_compute_encoder": "Reuse g_batch_enc if in batch mode",
+      "ds4_metal_end_compute_encoder": "No-op if in batch mode (keeps encoder open)",
+      "ds4_metal_finish_command_buffer": "If owned=0 (batch), return 1 immediately",
+      "ds4_metal_end_commands": "Close batch encoder, commit, wait"
+    }
+  },
+  "profiling": {
+    "enable": "L26F_PROFILE=1",
+    "sync_barriers": "L26F_PROFILE_SYNC=1 (adds GPU waits per stage, inflates timing)",
+    "stages": [
+      "GLA",
+      "MLA",
+      "MoE",
+      "Dense",
+      "Logits",
+      "Sample"
+    ],
+    "last_profile_ms_per_token": {
+      "gla_28layers": 12,
+      "mla_4layers": 4,
+      "moe_31layers": 30,
+      "logits": 1.2,
+      "other": 1,
+      "total": 48
+    }
+  },
+  "restart_context": {
+    "what_to_do_next": "Port kernel_mul_mm_id (mat-mat with expert index) from r2 for MoE prefill performance. The decode path uses mat-vec which is already near-optimal; the mat-mat kernel wins for batch>1.",
+    "where_is_the_code": {
+      "r2_mat_mm_id_kernel": "metal/l26f_ref_r2.metal line ~9843 (template kernel_mul_mm_id)",
+      "r2_map0_kernel": "metal/l26f_ref_r2.metal line ~9777 (kernel_mul_mm_id_map0 preprocessing)",
+      "r2_args_struct": "metal/l26f_ref_r2_impl.h line 507 (ggml_metal_kargs_mul_mm_id)",
+      "l26f_current_moe": "test_l26f_multilayer.c:1041 (l26f_moe_ffn_fused_prod)",
+      "l26f_fused_iq4nl": "metal/l26f_dense.metal:580 (kernel_l26f_fused_moe_iq4nl)",
+      "l26f_fused_q5k": "metal/l26f_dense.metal:864 (kernel_l26f_fused_moe_q5k)",
+      "l26f_moe_dispatch": "l26f_metal.m:15959 (l26f_metal_fused_moe_iq4nl)",
+      "l26f_q5k_dispatch": "l26f_metal.m:16006 (l26f_metal_fused_moe_q5k)"
+    },
+    "key_insights": [
+      "kernel_mul_mm_id uses simdgroup_half8x8 (SGEMM) with 64x32 output tiles, 4 SIMD groups per threadgroup",
+      "For single-token decode, mat-vec is optimal. mat-mat wins for batch>=32 tokens per expert",
+      "The remaining 1.56x decode gap is from kernel quality and dispatch efficiency, not mat-vec vs mat-mat",
+      "r2 ggml graph compiler fuses operations and may batch more aggressively",
+      "The Q5_K fused MoE kernel (kernel_l26f_fused_moe_q5k) currently uses NSG=1 \u2014 increasing could help",
+      "IQ4_NL fused gate+up kernel already shares input reads across gate and up weights",
+      "ds4_metal_args_mul_mv (from dense.metal) is the correct Metal-side struct for Q-quant matvec args, NOT ds4_metal_q8_0_matvec_args (which is host-side only)"
+    ],
+    "correctness_verification": "First 5 tokens must be: 1 -> 126887 -> 34661 -> 1 -> 96. Run: L26F_FUSED_MOE=1 ./test_l26f_multilayer ~/llama.cpp/models/Ling-2.6-flash-IQ4_NL-quality-bailing_hybrid-20260508-LJ.gguf 1 16 0"
+  },
+  "build": {
+    "command": "make clean && make test_l26f_multilayer",
+    "run": "L26F_FUSED_MOE=1 ./test_l26f_multilayer <model.gguf> <start_token> <n_tokens> <temp>",
+    "benchmark_16tok": "L26F_FUSED_MOE=1 ./test_l26f_multilayer ~/llama.cpp/models/Ling-2.6-flash-IQ4_NL-quality-bailing_hybrid-20260508-LJ.gguf 1 16 0",
+    "dependencies": "None (no external libs, Metal framework only)"
+  }
+};
+
+document.getElementById('tok-s').textContent = d.performance.current_tok_s;
+document.getElementById('timestamp').textContent = new Date().toISOString().slice(0, 16).replace('T', ' ');
+
+// Perf history
+const tb = document.getElementById('perf-tbody');
+d.performance.history.forEach((h, i) => {
+    const gain = i > 0 ? `+${((h.tok_s / d.performance.history[i-1].tok_s - 1) * 100).toFixed(0)}%` : '—';
+    const cls = i === d.performance.history.length - 1 ? 'highlight' : '';
+    tb.innerHTML += `<tr><td style="color:#aaa">${h.step.replace(/^\+ /, '')}</td><td class="num ${cls}">${h.tok_s}</td><td class="num" style="color:${i>0?'#6a9955':'#555'}">${gain}</td></tr>`;
+});
+
+// Dimensions
+const dg = document.getElementById('dims-grid');
+const dims = [
+    ['N', '4096', 'Hidden'], ['S', '128', 'GLA state'], ['V', '157184', 'Vocab'],
+    ['H', '32', 'Heads'], ['D', '192', 'Head dim'], ['K', '8', 'Selected'],
+    ['E', '256', 'Experts'], ['M', '1024', 'FFN int'], ['C', '512', 'KV lora']
+];
+dims.forEach(([l, v, d]) => {
+    dg.innerHTML += `<div class="dim-item"><div class="dim-label">${l} — ${d}</div><div class="dim-value">${v}</div></div>`;
+});
+
+// Files
+const fb = document.getElementById('files-tbody');
+const keyFiles = d.files.filter(f => f.path.startsWith('l26f') || f.path.startsWith('metal/l26f') || f.path === 'ds4_metal.m' || f.path === 'ds4_metal.h' || f.path === 'test_l26f_multilayer.c' || f.path.startsWith('metal/moe') || f.path.startsWith('metal/dense'));
+keyFiles.forEach(f => {
+    const isL26f = f.path.includes('l26f');
+    fb.innerHTML += `<tr><td style="color:${isL26f ? '#4ec9b0' : '#888'}">${f.path}</td><td class="num">${f.lines}</td><td style="color:#888">${f.role.split(':')[0]}</td></tr>`;
+});
+
+// Forward pass flow
+const fc = document.getElementById('flow-container');
+d.forward_pass.per_token_flow.forEach(step => {
+    const kernels = (step.kernels || []).map(k => k.replace('kernel_', '')).join(', ');
+    fc.innerHTML += `<div class="flow-step">
+        <span class="flow-num">${step.step}.</span>
+        <span class="flow-name">${step.name}</span>
+        <span class="flow-desc">${step.desc}</span>
+    </div>
+    ${kernels ? `<div style="margin-left:28px;margin-bottom:4px" class="flow-kernels">${kernels}</div>` : ''}`;
+});
+</script>
+</body>
+</html>
