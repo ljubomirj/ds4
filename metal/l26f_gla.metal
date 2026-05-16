@@ -225,6 +225,7 @@ template [[host_name("kernel_gla_ki_8")]] kernel kernel_gla_ki_t kernel_gla_ki_i
 typedef struct {
     int32_t head_dim;
     int32_t n_heads;
+    int32_t n_rot;
     int32_t position;
     float   theta;
     float   eps;
@@ -242,6 +243,7 @@ kernel void kernel_l26f_gla_qk_norm_rope(
         uint3 tpitg [[thread_position_in_threadgroup]])
 {
     const int S = args.head_dim;
+    const int nr = args.n_rot;
     const int h = (int)tgpig.x;
     const int which = (int)tgpig.y;
     const uint tid = tpitg.x;
@@ -267,11 +269,11 @@ kernel void kernel_l26f_gla_qk_norm_rope(
     }
 
     const float scale = rsqrt(sumsq[0] / (float)S + args.eps);
-    const int half_dim = S / 2;
-    if (tid < (uint)half_dim) {
+    const int half_rot = nr / 2;
+    if (tid < (uint)half_rot) {
         const int d0 = (int)tid;
-        const int d1 = d0 + half_dim;
-        const float freq = 1.0f / pow(args.theta, (float)(2 * d0) / (float)S);
+        const int d1 = d0 + half_rot;
+        const float freq = 1.0f / pow(args.theta, (float)(2 * d0) / (float)nr);
         const float angle = (float)args.position * freq;
         const float cos_a = cos(angle);
         const float sin_a = sin(angle);
@@ -279,6 +281,9 @@ kernel void kernel_l26f_gla_qk_norm_rope(
         const float x1 = src[base + d1] * scale * weight[d1];
         dst[base + d0] = x0 * cos_a - x1 * sin_a;
         dst[base + d1] = x0 * sin_a + x1 * cos_a;
+    }
+    for (int d = nr + (int)tid; d < S; d += 128) {
+        dst[base + d] = src[base + d] * scale * weight[d];
     }
 }
 

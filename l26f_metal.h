@@ -87,6 +87,30 @@ int l26f_metal_matvec_iq4_nl_residual(
     uint64_t                 in_dim,
     uint64_t                 out_dim);
 
+int l26f_metal_gla_qkv_gate_iq4_nl(
+    ds4_metal_tensor       *qkv_dst,
+    ds4_metal_tensor       *gate_dst,
+    const ds4_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 qkv_weight_offset,
+    uint64_t                 gate_weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 qkv_out_dim,
+    uint64_t                 gate_out_dim);
+
+int l26f_metal_gla_qkv_gate_q5_k(
+    ds4_metal_tensor       *qkv_dst,
+    ds4_metal_tensor       *gate_dst,
+    const ds4_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 qkv_weight_offset,
+    uint64_t                 gate_weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 qkv_out_dim,
+    uint64_t                 gate_out_dim);
+
 // RMS Norm (with weight)
 int l26f_metal_rms_norm_weight(
     ds4_metal_tensor       *out,
@@ -186,6 +210,7 @@ int l26f_metal_gla_qk_norm_rope(
     uint64_t                 k_weight_offset,
     uint32_t                 head_dim,
     uint32_t                 n_heads,
+    uint32_t                 n_rot,
     int32_t                  position,
     float                    theta,
     float                    eps);
@@ -495,6 +520,31 @@ int l26f_metal_argmax(
     ds4_metal_tensor       *dst,
     const ds4_metal_tensor *src,
     uint32_t                n);
+
+// Fused Q6_K LM-head matvec + per-threadgroup max reduction + CPU scan.
+// Computes Q6_K dot products for all vocab rows, tracks the per-threadgroup
+// maximum, and then scans the per-tg results on the CPU to find the global
+// argmax.  This avoids allocating the full 157K logits buffer and saves one
+// argmax dispatch for greedy (temp=0) decode.
+//
+// Args:
+//   src1        — normed hidden state (n_embd floats)
+//   model_map/size — mmap'd model
+//   weight_offset  — offset to output.weight (Q6_K)
+//   in_dim      — n_embd (4096)
+//   out_dim     — n_vocab (157184)
+//   max_pairs   — intermediate buffer for per-tg (float,int32_t) pairs,
+//                 size = ((out_dim + 3) / 4) * 8 bytes
+//
+// Returns the vocabulary index of the maximum logit, or -1 on error.
+int32_t l26f_metal_logits_head_q6k_argmax(
+    const ds4_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 out_dim,
+    ds4_metal_tensor        *max_pairs);
 
 // Group normalization (same as group RMS norm with mean subtraction).
 // src layout: [ne00, ne01, ne02], ngrp groups splitting ne02.

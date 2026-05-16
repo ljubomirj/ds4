@@ -188,6 +188,220 @@ kernel void kernel_mul_mv_iq4_nl_f32(
     }
 }
 
+typedef struct {
+    int32_t in_dim;
+    int32_t qkv_rows;
+    int32_t gate_rows;
+    int32_t nsg;
+    uint64_t qkv_row_bytes;
+    uint64_t gate_row_bytes;
+} l26f_args_gla_qkv_gate_iq4nl;
+
+kernel void kernel_l26f_gla_qkv_gate_iq4_nl_f32(
+    constant l26f_args_gla_qkv_gate_iq4nl & args [[buffer(0)]],
+    device const char               * qkv_weights  [[buffer(1)]],
+    device const char               * gate_weights [[buffer(2)]],
+    device const float              * input        [[buffer(3)]],
+    device       float              * qkv_out      [[buffer(4)]],
+    device       float              * gate_out     [[buffer(5)]],
+    threadgroup float               * shmem        [[threadgroup(0)]],
+    uint3  tgpig[[threadgroup_position_in_grid]],
+    ushort tiisg[[thread_index_in_simdgroup]],
+    ushort sgitg[[simdgroup_index_in_threadgroup]])
+{
+    const int NR0 = 2;
+    const int total_rows = args.qkv_rows + args.gate_rows;
+    const int n_blocks = args.in_dim / 32;
+    const int first_row = ((int)tgpig.x * args.nsg + (int)sgitg) * NR0;
+
+    const short ix = tiisg / 2;
+    const short it = tiisg % 2;
+
+    shmem[tiisg] = kvalues_iq4nl_f[tiisg % 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 yl[4];
+    float sumf[2] = {0.f};
+
+    device const float * yb = input + ix * 32 + it * 8;
+
+    uint32_t aux32[2];
+    thread const uint8_t * q8 = (thread const uint8_t *)aux32;
+
+    float4 qf1, qf2;
+
+    for (int ib = ix; ib < n_blocks; ib += 16) {
+        device const float4 * y4 = (device const float4 *)yb;
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        for (short row = 0; row < NR0; row++) {
+            const int out_row = first_row + row;
+            if (out_row >= total_rows) break;
+
+            const bool is_qkv = out_row < args.qkv_rows;
+            const int local_row = is_qkv ? out_row : out_row - args.qkv_rows;
+            device const block_iq4_nl * w = is_qkv ?
+                (device const block_iq4_nl *)(qkv_weights + (uint64_t)local_row * args.qkv_row_bytes) :
+                (device const block_iq4_nl *)(gate_weights + (uint64_t)local_row * args.gate_row_bytes);
+            device const block_iq4_nl & xb = w[ib];
+            device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8 * it);
+
+            float4 acc1 = {0.f}, acc2 = {0.f};
+
+            aux32[0] = q4[0] | (q4[1] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+            aux32[0] &= 0x0f0f0f0f;
+            qf1 = {shmem[q8[0]], shmem[q8[1]], shmem[q8[2]], shmem[q8[3]]};
+            qf2 = {shmem[q8[4]], shmem[q8[5]], shmem[q8[6]], shmem[q8[7]]};
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = q4[2] | (q4[3] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+            aux32[0] &= 0x0f0f0f0f;
+            qf1 = {shmem[q8[0]], shmem[q8[1]], shmem[q8[2]], shmem[q8[3]]};
+            qf2 = {shmem[q8[4]], shmem[q8[5]], shmem[q8[6]], shmem[q8[7]]};
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+            sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+        }
+
+        yb += 16 * 32;
+    }
+
+    for (int row = 0; row < NR0 && first_row + row < total_rows; ++row) {
+        const int out_row = first_row + row;
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            if (out_row < args.qkv_rows) {
+                qkv_out[out_row] = sum_all;
+            } else {
+                gate_out[out_row - args.qkv_rows] = sum_all;
+            }
+        }
+    }
+}
+
+typedef struct {
+    int32_t in_dim;
+    int32_t qkv_rows;
+    int32_t gate_rows;
+    uint64_t qkv_row_bytes;
+    uint64_t gate_row_bytes;
+} l26f_args_gla_qkv_gate_q5k;
+
+kernel void kernel_l26f_gla_qkv_gate_q5_k_f32(
+    constant l26f_args_gla_qkv_gate_q5k & args [[buffer(0)]],
+    device const char               * qkv_weights  [[buffer(1)]],
+    device const char               * gate_weights [[buffer(2)]],
+    device const float              * input        [[buffer(3)]],
+    device       float              * qkv_out      [[buffer(4)]],
+    device       float              * gate_out     [[buffer(5)]],
+    uint3  tgpig[[threadgroup_position_in_grid]],
+    ushort tiisg[[thread_index_in_simdgroup]],
+    ushort sgitg[[simdgroup_index_in_threadgroup]])
+{
+    const short NSG = 2;
+    const int total_rows = args.qkv_rows + args.gate_rows;
+    const int out_row = (int)tgpig.x * NSG + (int)sgitg;
+    if (out_row >= total_rows) return;
+
+    const bool is_qkv = out_row < args.qkv_rows;
+    const int row_in_tensor = is_qkv ? out_row : out_row - args.qkv_rows;
+    device const char * weights = is_qkv ?
+        qkv_weights + (uint64_t)row_in_tensor * args.qkv_row_bytes :
+        gate_weights + (uint64_t)row_in_tensor * args.gate_row_bytes;
+    device const block_q5_K * x = (device const block_q5_K *)weights;
+    device const float * yy = input;
+
+    const int nb = args.in_dim / QK_K;
+
+    float sumf = 0.f;
+    float yl[16], yh[16];
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
+
+    const short l0 = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
+
+    const uint8_t hm1 = 1u << (2 * iq);
+    const uint8_t hm2 = hm1 << 1;
+    const uint8_t hm3 = hm1 << 4;
+    const uint8_t hm4 = hm2 << 4;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    device const float * y1 = yy + ix * QK_K + y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const uint8_t * q1 = x[i].qs + q_offset;
+        device const uint8_t * qh = x[i].qh + l0;
+        device const half * dh = &x[i].d;
+        device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
+
+        device const float * y2 = y1 + 128;
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short l = 0; l < 8; ++l) {
+            yl[l+0] = y1[l +  0]; sumy[0] += yl[l+0];
+            yl[l+8] = y1[l + 32]; sumy[1] += yl[l+8];
+            yh[l+0] = y2[l +  0]; sumy[2] += yh[l+0];
+            yh[l+8] = y2[l + 32]; sumy[3] += yh[l+8];
+        }
+
+        device const uint8_t * q2 = q1 + 64;
+
+        sc16[0] = a[0] & kmask1;
+        sc16[1] = a[2] & kmask1;
+        sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+        sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+        float4 acc1 = {0.f};
+        float4 acc2 = {0.f};
+        FOR_UNROLL (short l = 0; l < 8; ++l) {
+            uint8_t h = qh[l];
+            acc1[0] += yl[l+0] * (q1[l] & 0x0F);
+            acc1[1] += yl[l+8] * (q1[l] & 0xF0);
+            acc1[2] += yh[l+0] * (q2[l] & 0x0F);
+            acc1[3] += yh[l+8] * (q2[l] & 0xF0);
+            acc2[0] += h & hm1 ? yl[l+0] : 0.f;
+            acc2[1] += h & hm2 ? yl[l+8] : 0.f;
+            acc2[2] += h & hm3 ? yh[l+0] : 0.f;
+            acc2[3] += h & hm4 ? yh[l+8] : 0.f;
+        }
+
+        sumf += dh[0] * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
+                         sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
+                         sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
+                         sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
+                dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+        y1 += 4 * QK_K;
+    }
+
+    const float total = simd_sum(sumf);
+    if (tiisg == 0) {
+        if (is_qkv) {
+            qkv_out[row_in_tensor] = total;
+        } else {
+            gate_out[row_in_tensor] = total;
+        }
+    }
+}
+
 kernel void kernel_mul_mv_iq4_nl_f32_nr4(
     constant l26f_args_mul_mv_iq4_nl & args [[buffer(0)]],
     device const char               * src0 [[buffer(1)]],
@@ -1639,4 +1853,130 @@ kernel void kernel_l26f_gather_experts(
     const uint64_t dst_off = (uint64_t)e * args.expert_bytes + offset_in_expert;
 
     dst[dst_off] = src[src_off];
+}
+
+// ---- Fused Q6_K LM-head matvec + per-threadgroup argmax ----
+// Computes Q6_K matvec for the output head (vocab x hidden), but instead of
+// writing all logits, tracks the maximum value and index within each
+// threadgroup and writes per-threadgroup (max_val, max_idx) pairs to a small
+// intermediate buffer.  The host then scans this buffer to get the global argmax.
+//
+// Dispatch: (vocab + 3) / 4 threadgroups, (32, 2, 1) threads per group.
+
+kernel void kernel_l26f_logits_head_q6k_argmax(
+    constant ds4_metal_args_mul_mv & args [[buffer(0)]],
+    device const char   * src0 [[buffer(1)]],  // Q6_K weights
+    device const char   * src1 [[buffer(2)]],  // input (normed hidden, 4096 floats)
+    device       float  * dst_max [[buffer(3)]], // per-tg max values
+    device       int32_t * dst_idx [[buffer(4)]], // per-tg max indices
+    threadgroup float   * shmem [[threadgroup(0)]],
+    uint   tgpig[[threadgroup_position_in_grid]],
+    ushort tiisg[[thread_index_in_simdgroup]],
+    ushort sgitg[[simdgroup_index_in_threadgroup]])
+{
+    const short NSG = 2;
+    const short nr0 = 2;
+
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = args.ne00 / QK_K;
+
+    // 1-D dispatch: tgpig directly indexes the output row block.
+    const int first_tg_row = (int)tgpig * NSG * nr0;
+    const int first_row = first_tg_row + (int)sgitg * nr0;
+
+    const uint64_t offset0 = (uint64_t)first_row * args.nb01;
+    const uint64_t offset1 = 0;
+
+    device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+    device const float      * yy = (device const float      *) (src1 + offset1);
+
+    float sumf[nr0] = { 0.f };
+
+    float yl[16];
+
+    const short tid = tiisg / 2;
+    const short ix  = tiisg % 2;
+    const short ip  = tid / 8;
+    const short il  = tid % 8;
+    const short l0  = 4 * il;
+    const short is  = 8 * ip + l0 / 16;
+
+    const short y_offset   = 128 * ip + l0;
+    const short q_offset_l =  64 * ip + l0;
+    const short q_offset_h =  32 * ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const uint8_t * q1 = x[i].ql + q_offset_l;
+        device const uint8_t * q2 = q1 + 32;
+        device const uint8_t * qh = x[i].qh + q_offset_h;
+        device const int8_t  * sc = x[i].scales + is;
+        device const half    * dh = &x[i].d;
+
+        device const float * y = yy + i * QK_K + y_offset;
+
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        for (short row = 0; row < nr0; ++row) {
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+
+            FOR_UNROLL (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+
+            sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+
+            q1 += args.nb01;
+            q2 += args.nb01;
+            qh += args.nb01;
+            sc += args.nb01;
+            dh += args.nb01 / 2;
+        }
+    }
+
+    // Find the max within this simdgroup's rows
+    float sg_max_val = -INFINITY;
+    int32_t sg_max_idx = -1;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0 && sum_all > sg_max_val) {
+            sg_max_val = sum_all;
+            sg_max_idx = first_row + row;
+        }
+    }
+
+    // Reduce across simdgroups via threadgroup memory
+    threadgroup float   tg_max_vals[2];
+    threadgroup int32_t tg_max_idxs[2];
+
+    if (tiisg == 0) {
+        tg_max_vals[sgitg] = sg_max_val;
+        tg_max_idxs[sgitg] = sg_max_idx;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // simdgroup 0 thread 0 writes the threadgroup result
+    if (sgitg == 0 && tiisg == 0) {
+        float final_max = tg_max_vals[0];
+        int32_t final_idx = tg_max_idxs[0];
+        if (tg_max_vals[1] > final_max) {
+            final_max = tg_max_vals[1];
+            final_idx = tg_max_idxs[1];
+        }
+        dst_max[tgpig] = final_max;
+        dst_idx[tgpig] = final_idx;
+    }
 }

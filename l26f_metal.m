@@ -2754,6 +2754,8 @@ int ds4_metal_init(void) {
                 @"kernel_l26f_mul_mm_id_map0_ne20_8",
                 @"kernel_l26f_mul_mm_id_iq4_nl_f32",
                 @"kernel_l26f_mul_mm_id_q5_k_f32",
+                @"kernel_l26f_gla_qkv_gate_iq4_nl_f32",
+                @"kernel_l26f_gla_qkv_gate_q5_k_f32",
                 @"kernel_l26f_batch_iq4_nl_matvec_simd",
                 @"kernel_l26f_moe_route_offsets",
                 @"kernel_l26f_moe_route_batch",
@@ -2761,6 +2763,7 @@ int ds4_metal_init(void) {
                 @"kernel_l26f_batch_swiglu",
                 @"kernel_l26f_fused_accum_residual",
                 @"kernel_l26f_gather_experts",
+                @"kernel_l26f_logits_head_q6k_argmax",
             ];
             int missing = 0;
             for (NSString *name in required_kernels) {
@@ -14812,6 +14815,7 @@ int l26f_metal_gla_qk_norm_rope(
     uint64_t                k_weight_offset,
     uint32_t                head_dim,
     uint32_t                n_heads,
+    uint32_t                n_rot,
     int32_t                 position,
     float                   theta,
     float                   eps)
@@ -14858,10 +14862,11 @@ int l26f_metal_gla_qk_norm_rope(
         struct {
             int32_t head_dim;
             int32_t n_heads;
+            int32_t n_rot;
             int32_t position;
             float   theta;
             float   eps;
-        } args = { (int32_t)head_dim, (int32_t)n_heads, position, theta, eps };
+        } args = { (int32_t)head_dim, (int32_t)n_heads, (int32_t)n_rot, position, theta, eps };
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
@@ -15126,6 +15131,174 @@ int l26f_metal_matvec_iq4_nl_residual(
 {
     return l26f_metal_matvec_iq4_nl_impl(dst, src1, model_map, model_size,
             weight_offset, in_dim, out_dim, 1, residual);
+}
+
+int l26f_metal_gla_qkv_gate_iq4_nl(
+    ds4_metal_tensor       *qkv_dst,
+    ds4_metal_tensor       *gate_dst,
+    const ds4_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 qkv_weight_offset,
+    uint64_t                 gate_weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 qkv_out_dim,
+    uint64_t                 gate_out_dim)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if ((in_dim & 31u) != 0 || in_dim == 0 || qkv_out_dim == 0 || gate_out_dim == 0) return 0;
+
+    const uint64_t blocks_per_row = in_dim / 32u;
+    const uint64_t row_bytes = blocks_per_row * 18u;
+    const uint64_t qkv_weight_bytes = qkv_out_dim * row_bytes;
+    const uint64_t gate_weight_bytes = gate_out_dim * row_bytes;
+    if (qkv_weight_offset > model_size || qkv_weight_bytes > model_size - qkv_weight_offset) return 0;
+    if (gate_weight_offset > model_size || gate_weight_bytes > model_size - gate_weight_offset) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            l26f_metal_get_cached_pipeline("kernel_l26f_gla_qkv_gate_iq4_nl_f32");
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(src1);
+        id<MTLBuffer> qkvbuf = ds4_metal_tensor_buffer(qkv_dst);
+        id<MTLBuffer> gatebuf = ds4_metal_tensor_buffer(gate_dst);
+        if (!xbuf || !qkvbuf || !gatebuf ||
+            ds4_metal_tensor_bytes(src1) < in_dim * sizeof(float) ||
+            ds4_metal_tensor_bytes(qkv_dst) < qkv_out_dim * sizeof(float) ||
+            ds4_metal_tensor_bytes(gate_dst) < gate_out_dim * sizeof(float)) return 0;
+
+        uint64_t qkv_inner_offset = 0;
+        id<MTLBuffer> qkv_wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+            qkv_weight_offset, qkv_weight_bytes, &qkv_inner_offset);
+        if (!qkv_wbuf) return 0;
+
+        uint64_t gate_inner_offset = 0;
+        id<MTLBuffer> gate_wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+            gate_weight_offset, gate_weight_bytes, &gate_inner_offset);
+        if (!gate_wbuf) return 0;
+
+        struct {
+            int32_t in_dim;
+            int32_t qkv_rows;
+            int32_t gate_rows;
+            int32_t nsg;
+            uint64_t qkv_row_bytes;
+            uint64_t gate_row_bytes;
+        } args = {
+            (int32_t)in_dim,
+            (int32_t)qkv_out_dim,
+            (int32_t)gate_out_dim,
+            1,
+            row_bytes,
+            row_bytes,
+        };
+
+        const uint64_t total_rows = qkv_out_dim + gate_out_dim;
+        const uint64_t nr0 = 2;
+        const uint64_t nsg = 1;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qkv_wbuf offset:(NSUInteger)qkv_inner_offset atIndex:1];
+        [enc setBuffer:gate_wbuf offset:(NSUInteger)gate_inner_offset atIndex:2];
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(src1) atIndex:3];
+        [enc setBuffer:qkvbuf offset:ds4_metal_tensor_offset(qkv_dst) atIndex:4];
+        [enc setBuffer:gatebuf offset:ds4_metal_tensor_offset(gate_dst) atIndex:5];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((total_rows + nr0 * nsg - 1u) / (nr0 * nsg)), 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        return ds4_metal_finish_command_buffer(cb, owned, "l26f_gla_qkv_gate_iq4_nl");
+    }
+}
+
+int l26f_metal_gla_qkv_gate_q5_k(
+    ds4_metal_tensor       *qkv_dst,
+    ds4_metal_tensor       *gate_dst,
+    const ds4_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 qkv_weight_offset,
+    uint64_t                 gate_weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 qkv_out_dim,
+    uint64_t                 gate_out_dim)
+{
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if ((in_dim & 255u) != 0 || in_dim == 0 || qkv_out_dim == 0 || gate_out_dim == 0) return 0;
+
+    const uint64_t blocks_per_row = in_dim / 256u;
+    const uint64_t row_bytes = blocks_per_row * 176u;
+    const uint64_t qkv_weight_bytes = qkv_out_dim * row_bytes;
+    const uint64_t gate_weight_bytes = gate_out_dim * row_bytes;
+    if (qkv_weight_offset > model_size || qkv_weight_bytes > model_size - qkv_weight_offset) return 0;
+    if (gate_weight_offset > model_size || gate_weight_bytes > model_size - gate_weight_offset) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            l26f_metal_get_cached_pipeline("kernel_l26f_gla_qkv_gate_q5_k_f32");
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> xbuf = ds4_metal_tensor_buffer(src1);
+        id<MTLBuffer> qkvbuf = ds4_metal_tensor_buffer(qkv_dst);
+        id<MTLBuffer> gatebuf = ds4_metal_tensor_buffer(gate_dst);
+        if (!xbuf || !qkvbuf || !gatebuf ||
+            ds4_metal_tensor_bytes(src1) < in_dim * sizeof(float) ||
+            ds4_metal_tensor_bytes(qkv_dst) < qkv_out_dim * sizeof(float) ||
+            ds4_metal_tensor_bytes(gate_dst) < gate_out_dim * sizeof(float)) return 0;
+
+        uint64_t qkv_inner_offset = 0;
+        id<MTLBuffer> qkv_wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+            qkv_weight_offset, qkv_weight_bytes, &qkv_inner_offset);
+        if (!qkv_wbuf) return 0;
+
+        uint64_t gate_inner_offset = 0;
+        id<MTLBuffer> gate_wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+            gate_weight_offset, gate_weight_bytes, &gate_inner_offset);
+        if (!gate_wbuf) return 0;
+
+        struct {
+            int32_t in_dim;
+            int32_t qkv_rows;
+            int32_t gate_rows;
+            uint64_t qkv_row_bytes;
+            uint64_t gate_row_bytes;
+        } args = {
+            (int32_t)in_dim,
+            (int32_t)qkv_out_dim,
+            (int32_t)gate_out_dim,
+            row_bytes,
+            row_bytes,
+        };
+
+        const uint64_t total_rows = qkv_out_dim + gate_out_dim;
+        const uint64_t nsg = 2;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qkv_wbuf offset:(NSUInteger)qkv_inner_offset atIndex:1];
+        [enc setBuffer:gate_wbuf offset:(NSUInteger)gate_inner_offset atIndex:2];
+        [enc setBuffer:xbuf offset:ds4_metal_tensor_offset(src1) atIndex:3];
+        [enc setBuffer:qkvbuf offset:ds4_metal_tensor_offset(qkv_dst) atIndex:4];
+        [enc setBuffer:gatebuf offset:ds4_metal_tensor_offset(gate_dst) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((total_rows + nsg - 1u) / nsg), 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32 * (NSUInteger)nsg, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        return ds4_metal_finish_command_buffer(cb, owned, "l26f_gla_qkv_gate_q5_k");
+    }
 }
 
 // Helper to get a cached pipeline by name
@@ -16900,6 +17073,123 @@ int l26f_metal_argmax(
         ds4_metal_end_compute_encoder(cb, enc);
 
         return ds4_metal_finish_command_buffer(cb, owned, "l26f_argmax");
+    }
+}
+
+// =========================================================================
+// L26F: Fused Q6_K LM-head + per-threadgroup argmax
+// =========================================================================
+
+int32_t l26f_metal_logits_head_q6k_argmax(
+    const ds4_metal_tensor *src1,
+    const void              *model_map,
+    uint64_t                 model_size,
+    uint64_t                 weight_offset,
+    uint64_t                 in_dim,
+    uint64_t                 out_dim,
+    ds4_metal_tensor        *max_pairs)
+{
+    if (!g_initialized && !ds4_metal_init()) return -1;
+    if ((in_dim & 255u) != 0 || in_dim == 0 || out_dim == 0) return -1;
+
+    const int32_t block_size = 256;
+    const int32_t type_size = 210; // block_q6_K
+    const int32_t nr0 = 2, nsg = 2;
+    const uint64_t row_bytes = (in_dim / (uint64_t)block_size) * type_size;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    const uint32_t rows_per_tg = (uint32_t)(nr0 * nsg); // 4
+    const uint32_t n_tg = (uint32_t)((out_dim + rows_per_tg - 1) / rows_per_tg);
+    const uint64_t pairs_bytes = (uint64_t)n_tg * 8u; // float + int32_t per tg
+
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
+        return -1;
+    if (ds4_metal_tensor_bytes(max_pairs) < pairs_bytes) {
+        fprintf(stderr, "l26f: max_pairs buffer too small (%llu < %llu)\n",
+                (unsigned long long)ds4_metal_tensor_bytes(max_pairs),
+                (unsigned long long)pairs_bytes);
+        return -1;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            l26f_metal_get_cached_pipeline("kernel_l26f_logits_head_q6k_argmax");
+        if (!pipeline) return -1;
+
+        id<MTLBuffer> xbuf   = ds4_metal_tensor_buffer(src1);
+        id<MTLBuffer> outbuf = ds4_metal_tensor_buffer(max_pairs);
+        if (!xbuf || !outbuf) return -1;
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_metal_wrap_model_range(model_map, model_size,
+            weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return -1;
+
+        ds4_metal_q8_0_matvec_args args = {
+            .ne00 = (int32_t)in_dim, .ne01 = (int32_t)out_dim, .ne02 = 1,
+            .nb00 = type_size, .nb01 = (int32_t)row_bytes,
+            .nb02 = (int32_t)weight_bytes, .nb03 = (int32_t)weight_bytes,
+            .ne10 = (int32_t)in_dim, .ne11 = 1, .ne12 = 1,
+            .nb10 = sizeof(float), .nb11 = (int32_t)(in_dim * sizeof(float)),
+            .nb12 = (uint64_t)(in_dim * sizeof(float)),
+            .nb13 = (uint64_t)(in_dim * sizeof(float)),
+            .ne0 = (int32_t)out_dim, .ne1 = 1,
+            .nr0 = nr0, .r2 = 1, .r3 = 1,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return -1;
+
+        NSUInteger off = ds4_metal_tensor_offset(max_pairs);
+
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf  offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf  offset:ds4_metal_tensor_offset(src1) atIndex:2];
+        [enc setBuffer:outbuf offset:off atIndex:3];
+        [enc setBuffer:outbuf offset:off + (NSUInteger)(n_tg * sizeof(float)) atIndex:4];
+        NSUInteger tg_x = (NSUInteger)n_tg;
+        [enc dispatchThreadgroups:MTLSizeMake(tg_x, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned,
+                "l26f_logits_head_q6k_argmax"))
+            return -1;
+    }
+
+    // CPU reduction: scan per-threadgroup results to find global argmax.
+    // Layout: first n_tg floats = max values, next n_tg int32s = indices.
+    {
+        const uint32_t pairs = n_tg;
+        float *vals = (float *)malloc((uint64_t)pairs * sizeof(float));
+        int32_t *idxs = (int32_t *)malloc((uint64_t)pairs * sizeof(int32_t));
+        if (!vals || !idxs) { free(vals); free(idxs); return -1; }
+
+        if (!ds4_metal_tensor_read(max_pairs, 0, vals,
+                (uint64_t)pairs * sizeof(float))) {
+            free(vals); free(idxs);
+            return -1;
+        }
+        if (!ds4_metal_tensor_read(max_pairs,
+                (uint64_t)pairs * sizeof(float), idxs,
+                (uint64_t)pairs * sizeof(int32_t))) {
+            free(vals); free(idxs);
+            return -1;
+        }
+
+        float best_val = -INFINITY;
+        int32_t best_idx = -1;
+        for (uint32_t i = 0; i < pairs; i++) {
+            if (vals[i] > best_val) {
+                best_val = vals[i];
+                best_idx = idxs[i];
+            }
+        }
+
+        free(vals); free(idxs);
+        return best_idx;
     }
 }
 

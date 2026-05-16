@@ -3,6 +3,8 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/build_debug/
+/build_release/
 /ds4flash.gguf
 /TODO.md
 /gguf/
@@ -20,3 +22,4 @@ README.LJ.[0-9]*
 OLD/
 .omx/
 *.bak
+traces/

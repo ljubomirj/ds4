@@ -127,6 +127,7 @@ typedef struct {
     ds4_metal_tensor *hidden_1xN;
     ds4_metal_tensor *output_normed_1xN;
     ds4_metal_tensor *logits_1xV;
+    ds4_metal_tensor *logits_max_pairs;  // per-tg (float,int32_t) for fused argmax
     ds4_metal_tensor *sample_idx_1xI;
     ds4_metal_tensor *moe_gate_all_off_1xE[32];
     ds4_metal_tensor *moe_up_all_off_1xE[32];
@@ -208,6 +209,27 @@ static int XREG_LAYERS_ENABLED(void) {
     return enabled;
 }
 
+static int XDBG_GLA_FUSE_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        enabled = getenv("L26F_DEBUG_GLA_FUSE") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int XCFG_GLA_QKV_GATE_FUSE_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 1;
+    if (!initialized) {
+        const char *v = getenv("L26F_GLA_QKV_GATE_FUSE");
+        enabled = !(v && v[0] == '0' && v[1] == '\0');
+        initialized = 1;
+    }
+    return enabled;
+}
+
 #define XLOG_REG_FPRINTF(...) fprintf(stderr, __VA_ARGS__)
 #define XLOG_REG(args) do { \
     if (XREG_ENABLED()) { \
@@ -231,6 +253,13 @@ static int XREG_LAYERS_ENABLED(void) {
 #define XLOG_PROF(args) do { \
     if (XPROF_ENABLED()) { \
         fprintf(stderr, "XPROF "); \
+        XLOG_REG_FPRINTF args; \
+        fputc('\n', stderr); \
+    } \
+} while (0)
+#define XLOG_GLA_FUSE(args) do { \
+    if (XDBG_GLA_FUSE_ENABLED()) { \
+        fprintf(stderr, "GLA_FUSE "); \
         XLOG_REG_FPRINTF args; \
         fputc('\n', stderr); \
     } \
@@ -280,6 +309,17 @@ static XREG_TENSOR_SUMMARY_1xU XREG_TENSOR_SUMMARIZE_1xU(const ds4_metal_tensor 
 #define XLOG_REG_LAYER(args) ((void)0)
 #define XLOG_MODEL(args)     ((void)0)
 #define XLOG_PROF(args)      ((void)0)
+#define XLOG_GLA_FUSE(args)  ((void)0)
+static int XCFG_GLA_QKV_GATE_FUSE_ENABLED(void) {
+    static int initialized = 0;
+    static int enabled = 1;
+    if (!initialized) {
+        const char *v = getenv("L26F_GLA_QKV_GATE_FUSE");
+        enabled = !(v && v[0] == '0' && v[1] == '\0');
+        initialized = 1;
+    }
+    return enabled;
+}
 #endif
 
 typedef enum {
@@ -721,19 +761,52 @@ static int l26f_gla_layer(
         return 0;
     if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_NORM, layer, XPROF_T0)) return 0;
 
-    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
-    if (!l26f_metal_matvec_quant(c->qkv_1x3N, c->normed_1xN,
-            m->map, m->size, wt_qkv_Nx3N->abs_offset,
-            wt_qkv_Nx3N->dim[0], wt_qkv_Nx3N->dim[1], wt_qkv_Nx3N->type, 1))
-        return 0;
-    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_QKV, layer, XPROF_T0)) return 0;
+    const int qkv_gate_shape_ok =
+        wt_qkv_Nx3N->dim[0] == n_embd && wt_gate_NxN->dim[0] == n_embd;
+    const int use_fused_qkv_gate_iq4 =
+        XCFG_GLA_QKV_GATE_FUSE_ENABLED() &&
+        wt_qkv_Nx3N->type == 20 && wt_gate_NxN->type == 20 &&
+        qkv_gate_shape_ok;
+    const int use_fused_qkv_gate_q5 =
+        XCFG_GLA_QKV_GATE_FUSE_ENABLED() &&
+        wt_qkv_Nx3N->type == 13 && wt_gate_NxN->type == 13 &&
+        qkv_gate_shape_ok;
+    XLOG_GLA_FUSE(("layer=%u qkv_type=%u/%s qkv_dim=%llux%llu gate_type=%u/%s gate_dim=%llux%llu use_iq4=%d use_q5=%d",
+            layer,
+            wt_qkv_Nx3N->type, l26f_type_name(wt_qkv_Nx3N->type),
+            (unsigned long long)wt_qkv_Nx3N->dim[0], (unsigned long long)wt_qkv_Nx3N->dim[1],
+            wt_gate_NxN->type, l26f_type_name(wt_gate_NxN->type),
+            (unsigned long long)wt_gate_NxN->dim[0], (unsigned long long)wt_gate_NxN->dim[1],
+            use_fused_qkv_gate_iq4, use_fused_qkv_gate_q5));
+    if (use_fused_qkv_gate_iq4) {
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+        if (!l26f_metal_gla_qkv_gate_iq4_nl(c->qkv_1x3N, c->gate_out_1xN, c->normed_1xN,
+                m->map, m->size, wt_qkv_Nx3N->abs_offset, wt_gate_NxN->abs_offset,
+                wt_qkv_Nx3N->dim[0], wt_qkv_Nx3N->dim[1], wt_gate_NxN->dim[1]))
+            return 0;
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_QKV, layer, XPROF_T0)) return 0;
+    } else if (use_fused_qkv_gate_q5) {
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+        if (!l26f_metal_gla_qkv_gate_q5_k(c->qkv_1x3N, c->gate_out_1xN, c->normed_1xN,
+                m->map, m->size, wt_qkv_Nx3N->abs_offset, wt_gate_NxN->abs_offset,
+                wt_qkv_Nx3N->dim[0], wt_qkv_Nx3N->dim[1], wt_gate_NxN->dim[1]))
+            return 0;
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_QKV, layer, XPROF_T0)) return 0;
+    } else {
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+        if (!l26f_metal_matvec_quant(c->qkv_1x3N, c->normed_1xN,
+                m->map, m->size, wt_qkv_Nx3N->abs_offset,
+                wt_qkv_Nx3N->dim[0], wt_qkv_Nx3N->dim[1], wt_qkv_Nx3N->type, 1))
+            return 0;
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_QKV, layer, XPROF_T0)) return 0;
 
-    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
-    if (!l26f_metal_matvec_quant(c->gate_out_1xN, c->normed_1xN,
-            m->map, m->size, wt_gate_NxN->abs_offset,
-            wt_gate_NxN->dim[0], wt_gate_NxN->dim[1], wt_gate_NxN->type, 1))
-        return 0;
-    if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_GATE, layer, XPROF_T0)) return 0;
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_BEGIN(&XPROF_T0)) return 0;
+        if (!l26f_metal_matvec_quant(c->gate_out_1xN, c->normed_1xN,
+                m->map, m->size, wt_gate_NxN->abs_offset,
+                wt_gate_NxN->dim[0], wt_gate_NxN->dim[1], wt_gate_NxN->type, 1))
+            return 0;
+        if (XPROF_GLA_DEEP_ENABLED() && !XPROF_STAGE_END(XPROF_GLA_GATE, layer, XPROF_T0)) return 0;
+    }
 
     ds4_metal_tensor *q_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, 0, act_bytes);
     ds4_metal_tensor *k_view_1xN = ds4_metal_tensor_view(c->qkv_1x3N, act_bytes, act_bytes);
@@ -748,7 +821,7 @@ static int l26f_gla_layer(
     int ok = l26f_metal_gla_qk_norm_rope(c->q_rope_1xN, c->k_rope_1xN,
                     q_view_1xN, k_view_1xN,
                     m->map, m->size, wt_q_norm_S->abs_offset, wt_k_norm_S->abs_offset,
-                    S, H, position, m->rope_theta, m->rms_norm_eps);
+                    S, H, m->n_rot, position, m->rope_theta, m->rms_norm_eps);
     if (ok && !s->gla_slopes_1xN[layer]) ok = 0;
     if (!ok) {
         ds4_metal_tensor_free(v_view_1xN);
@@ -2053,6 +2126,11 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
     s->hidden_1xN         = ds4_metal_tensor_alloc(act_bytes);
     s->output_normed_1xN  = ds4_metal_tensor_alloc(act_bytes);
     s->logits_1xV         = ds4_metal_tensor_alloc((uint64_t)m->n_vocab * sizeof(float));
+    {
+        const uint32_t rows_per_tg = 4;
+        const uint32_t n_tg = (uint32_t)(((uint64_t)m->n_vocab + rows_per_tg - 1) / rows_per_tg);
+        s->logits_max_pairs = ds4_metal_tensor_alloc((uint64_t)n_tg * 8u);
+    }
     s->sample_idx_1xI     = ds4_metal_tensor_alloc(sizeof(int32_t));
 
     // Zero all compute buffers to eliminate uninitialized-memory non-determinism
@@ -2184,7 +2262,8 @@ static int l26f_session_init(l26f_session *s, l26f_model *m) {
         !s->comp.attn_proj_1xN || !s->comp.post_attn_1xN ||
         !s->comp.ffn_normed_1xN || !s->comp.ffn_gate_1xF || !s->comp.ffn_up_1xF ||
         !s->comp.ffn_mid_1xF || !s->comp.ffn_down_1xN ||
-        !s->hidden_1xN || !s->output_normed_1xN || !s->logits_1xV || !s->sample_idx_1xI) {
+        !s->hidden_1xN || !s->output_normed_1xN || !s->logits_1xV ||
+        !s->logits_max_pairs || !s->sample_idx_1xI) {
         fprintf(stderr, "l26f: OOM compute buffers\n");
         return 0;
     }
@@ -2225,6 +2304,7 @@ static void l26f_session_free(l26f_session *s) {
     ds4_metal_tensor_free(s->hidden_1xN);
     ds4_metal_tensor_free(s->output_normed_1xN);
     ds4_metal_tensor_free(s->logits_1xV);
+    ds4_metal_tensor_free(s->logits_max_pairs);
     ds4_metal_tensor_free(s->sample_idx_1xI);
     for (uint32_t i = 0; i < 32; i++) {
         if (s->gla_states[i].state)
@@ -2471,9 +2551,42 @@ static int32_t l26f_sample(l26f_session *s, const l26f_sample_params *p, uint64_
 }
 
 static int32_t l26f_output_greedy_token(l26f_session *s) {
-    const uint32_t V = s->model->n_vocab;
+    l26f_model *m = s->model;
+    l26f_tensor *wt_norm_N  = l26f_model_find_tensor(m, "output_norm.weight");
+    l26f_tensor *wt_out_NxV = l26f_model_find_tensor(m, "output.weight");
+    if (!wt_norm_N || !wt_out_NxV) return -1;
+
+    const uint32_t V = m->n_vocab;
+    static int use_fused_cache = -1;
+    if (use_fused_cache < 0) {
+        int enabled = (wt_out_NxV->type == 14); // Q6_K
+        const char *env = getenv("L26F_LOGITS_FUSE");
+        if (env && env[0] == '0') enabled = 0;
+        use_fused_cache = enabled;
+    }
+    const int use_fused = use_fused_cache;
+
     if (!ds4_metal_begin_commands()) return -1;
-    if (!l26f_output_logits(s)) {
+
+    if (!ds4_metal_rms_norm_weight_tensor(s->output_normed_1xN, s->hidden_1xN,
+            m->map, m->size, wt_norm_N->abs_offset, m->n_embd, m->rms_norm_eps)) {
+        (void)ds4_metal_end_commands();
+        return -1;
+    }
+
+    if (use_fused) {
+        // Fused Q6_K matvec + per-threadgroup argmax + CPU reduction
+        if (!ds4_metal_end_commands()) return -1;
+        int32_t result = l26f_metal_logits_head_q6k_argmax(
+            s->output_normed_1xN, m->map, m->size,
+            wt_out_NxV->abs_offset, m->n_embd, V, s->logits_max_pairs);
+        return result;
+    }
+
+    // Fallback: separate matvec + argmax
+    if (!l26f_metal_matvec_quant(s->logits_1xV, s->output_normed_1xN,
+            m->map, m->size, wt_out_NxV->abs_offset,
+            wt_out_NxV->dim[0], wt_out_NxV->dim[1], wt_out_NxV->type, 1)) {
         (void)ds4_metal_end_commands();
         return -1;
     }
@@ -2488,12 +2601,6 @@ static int32_t l26f_output_greedy_token(l26f_session *s) {
         return -1;
     }
     return result;
-}
-
-static int32_t l26f_argmax(l26f_session *s) {
-    l26f_sample_params p = {0, 0, 1.0f, 0};
-    uint64_t rng = 0;
-    return l26f_sample(s, &p, &rng);
 }
 
 static int l26f_batch_layers(void) {
@@ -2656,6 +2763,22 @@ static int l26f_forward_pass(l26f_session *session, l26f_model *model, int posit
             return 0;
         }
     }
+
+    L26F_PREFILL_LOG("PREFILL: embedding %d tokens into hidden_TxN", n_tokens);
+    for (int t = 0; t < n_tokens; t++) {
+        if (!l26f_embed_token(session, (uint32_t)tokens[t])) {
+            fprintf(stderr, "l26f: embed failed for prompt token %d\n", tokens[t]);
+            return 0;
+        }
+        float *row_1xN = (float *)malloc(row_bytes);
+        if (!row_1xN) return 0;
+        ds4_metal_tensor_read(session->hidden_1xN, 0, row_1xN, row_bytes);
+        { char _ctx[32]; snprintf(_ctx, sizeof(_ctx), "embed t=%d", t);
+          L26F_NAN_CHECK("embed→hidden_1xN", row_1xN, n_embd, _ctx); }
+        ds4_metal_tensor_write(p->hidden_TxN, (uint64_t)t * row_bytes, row_1xN, row_bytes);
+        free(row_1xN);
+    }
+    L26F_PREFILL_CKPT("hidden_TxN_after_embed", p->hidden_TxN, (uint64_t)n_tokens * row_bytes, 255, -1);
 
     for (uint32_t il = 0; il < 32; il++) {
         char prof_label[64];
@@ -2933,30 +3056,21 @@ int main(int argc, char **argv) {
     }
 
     printf("Prefilling %d prompt tokens...\n", n_prompt);
-    if (n_prompt > 1) {
-        session.prefill = l26f_prefill_alloc(model.n_embd, 1024);
-        if (!session.prefill) {
-            fprintf(stderr, "Prefill buffer alloc failed\n"); return 1;
-        }
+    {
         for (int i = 0; i < n_prompt; i++) {
             char tokbuf_prompt[256];
             l26f_token_decode(tok, prompt_tokens[i], tokbuf_prompt, sizeof(tokbuf_prompt));
             printf("  [%d] token %d: \"%s\"\n", i, prompt_tokens[i], tokbuf_prompt);
         }
-        if (!l26f_forward_pass_prefill(&session, &model, prompt_tokens, n_prompt)) {
-            fprintf(stderr, "Batch prefill failed\n"); return 1;
-        }
-    } else {
-        char tokbuf_prompt[256];
-        l26f_token_decode(tok, prompt_tokens[0], tokbuf_prompt, sizeof(tokbuf_prompt));
-        printf("  [0] token %d: \"%s\"\n", prompt_tokens[0], tokbuf_prompt);
-        if (!l26f_embed_token(&session, (uint32_t)prompt_tokens[0])) {
-            fprintf(stderr, "Embed failed for prompt token %d\n", prompt_tokens[0]);
-            return 1;
-        }
-        if (!l26f_forward_pass(&session, &model, 0, false)) {
-            fprintf(stderr, "Forward pass failed for prompt token %d\n", prompt_tokens[0]);
-            return 1;
+        for (int i = 0; i < n_prompt; i++) {
+            if (!l26f_embed_token(&session, (uint32_t)prompt_tokens[i])) {
+                fprintf(stderr, "Embed failed for prompt token %d\n", prompt_tokens[i]);
+                return 1;
+            }
+            if (!l26f_forward_pass(&session, &model, i, false)) {
+                fprintf(stderr, "Forward pass failed at token %d\n", i);
+                return 1;
+            }
         }
     }
 
