@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -5546,6 +5547,14 @@ typedef struct {
     bool output_line_open;
     bool prompt_below_output;
     int output_col;
+    bool scroll_region;
+    int term_rows;
+    int term_cols;
+    int output_bottom;
+    int prompt_row;
+    int reserved_rows;
+    bool output_cursor_saved;
+    bool output_at_scroll_boundary;
     char cpr_buf[32];
     size_t cpr_len;
     bool paste_open;
@@ -5555,6 +5564,7 @@ typedef struct {
 } agent_editor;
 
 static void editor_queue_bytes(agent_editor *ed, const char *buf, size_t len);
+static void editor_hide(agent_editor *ed);
 
 typedef enum {
     CPR_INVALID,
@@ -5822,21 +5832,206 @@ static void editor_move_to_output_cursor(agent_editor *ed) {
     if (n > 0) write_all(STDOUT_FILENO, seq, (size_t)n);
 }
 
+static bool editor_get_terminal_size(int *rows, int *cols) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0) return false;
+    if (ws.ws_row < 1 || ws.ws_col < 1) return false;
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+    return true;
+}
+
+static void editor_csi_cursor(int row, int col) {
+    char seq[64];
+    int n = snprintf(seq, sizeof(seq), "\x1b[%d;%dH", row, col);
+    if (n > 0) write_all(STDOUT_FILENO, seq, (size_t)n);
+}
+
+static void editor_save_output_cursor(agent_editor *ed) {
+    if (!ed->scroll_region) return;
+    write_all(STDOUT_FILENO, "\0337", 2);
+    ed->output_cursor_saved = true;
+}
+
+static void editor_restore_output_cursor(agent_editor *ed) {
+    if (!ed->scroll_region) return;
+    if (ed->output_cursor_saved) {
+        write_all(STDOUT_FILENO, "\0338", 2);
+    } else {
+        editor_csi_cursor(ed->output_bottom, 1);
+    }
+}
+
+static void editor_move_to_prompt_row(agent_editor *ed) {
+    if (!ed->scroll_region) return;
+    editor_csi_cursor(ed->prompt_row, 1);
+}
+
+static void editor_clear_row(int row) {
+    editor_csi_cursor(row, 1);
+    write_all(STDOUT_FILENO, "\r\x1b[0K", 5);
+}
+
+static void editor_set_scroll_margin(int bottom) {
+    char seq[96];
+    int n = snprintf(seq, sizeof(seq), "\x1b[1;%dr", bottom);
+    if (n > 0) write_all(STDOUT_FILENO, seq, (size_t)n);
+}
+
+static void editor_scroll_output_up(int bottom, int lines) {
+    if (lines <= 0) return;
+    editor_set_scroll_margin(bottom);
+    editor_csi_cursor(bottom, 1);
+    for (int i = 0; i < lines; i++)
+        write_all(STDOUT_FILENO, "\n", 1);
+}
+
+static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
+                                     bool allow_shrink,
+                                     bool scroll_on_grow) {
+    if (!ed->scroll_region) return false;
+
+    int rows = 0, cols = 0;
+    if (!editor_get_terminal_size(&rows, &cols)) return false;
+    if (rows < 8 || cols < 20) return false;
+    if (reserved_rows < 2) reserved_rows = 2;
+    if (reserved_rows > rows - 2) reserved_rows = rows - 2;
+    if (!allow_shrink && ed->reserved_rows > 0 &&
+        ed->term_rows == rows && ed->term_cols == cols &&
+        reserved_rows < ed->reserved_rows)
+    {
+        reserved_rows = ed->reserved_rows;
+    }
+
+    int output_bottom = rows - reserved_rows;
+    int prompt_row = output_bottom + 1;
+    bool changed = ed->term_rows != rows ||
+                   ed->term_cols != cols ||
+                   ed->output_bottom != output_bottom ||
+                   ed->prompt_row != prompt_row ||
+                   ed->reserved_rows != reserved_rows;
+    if (!changed) return true;
+
+    /* If the prompt grows, rows that were output rows become prompt rows.  Do
+     * not simply clear them: first scroll the old output region upward by the
+     * number of newly reserved rows, exactly as if the model had printed more
+     * lines.  If the prompt shrinks, no output is restored; the output region
+     * simply grows downward and the prompt/status block remains bottom
+     * anchored. */
+    bool scrolled_output = false;
+    if (scroll_on_grow && ed->output_at_scroll_boundary &&
+        ed->term_rows == rows && ed->term_cols == cols &&
+        ed->output_bottom > 0 && output_bottom < ed->output_bottom)
+    {
+        editor_scroll_output_up(ed->output_bottom,
+                                ed->output_bottom - output_bottom);
+        scrolled_output = true;
+    }
+
+    editor_set_scroll_margin(output_bottom);
+
+    ed->term_rows = rows;
+    ed->term_cols = cols;
+    ed->output_bottom = output_bottom;
+    ed->prompt_row = prompt_row;
+    ed->reserved_rows = reserved_rows;
+    ed->output_cursor_saved = false;
+    ed->output_at_scroll_boundary = scrolled_output;
+
+    for (int row = prompt_row; row <= rows; row++)
+        editor_clear_row(row);
+    editor_csi_cursor(output_bottom, 1);
+    editor_save_output_cursor(ed);
+    editor_move_to_prompt_row(ed);
+    return true;
+}
+
+static int editor_linenoise_layout_changed(struct linenoiseState *l,
+                                           size_t prompt_rows,
+                                           size_t status_rows,
+                                           void *privdata) {
+    (void)l;
+    agent_editor *ed = privdata;
+    if (!ed || !ed->scroll_region) return 0;
+    if (prompt_rows < 1) prompt_rows = 1;
+    int reserved = (int)(prompt_rows + status_rows);
+    if (!editor_set_scroll_layout(ed, reserved, true, true)) return 0;
+    return ed->prompt_row;
+}
+
+/* Keep generated output inside a scroll region that excludes the live prompt
+ * and status footer.  This lets terminals scroll model/tool output naturally
+ * without rewriting the prompt on every streamed token, which is especially
+ * important over SSH where full redraws are visibly expensive. */
+static bool editor_configure_scroll_region(agent_editor *ed) {
+    if (ed->scroll_region) return true;
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return false;
+
+    int rows = 0, cols = 0;
+    if (!editor_get_terminal_size(&rows, &cols)) return false;
+    if (rows < 8 || cols < 20) return false;
+
+    ed->term_rows = 0;
+    ed->term_cols = 0;
+    ed->output_bottom = 0;
+    ed->prompt_row = 0;
+    ed->reserved_rows = 0;
+    ed->output_cursor_saved = false;
+    ed->output_at_scroll_boundary = false;
+    ed->scroll_region = true;
+    if (!editor_set_scroll_layout(ed, 2, true, false)) return false;
+
+    /* The agent prints backend startup lines before the editor exists.  Once
+     * the scroll region is installed, create an append line at the bottom of
+     * that region instead of guessing that the old terminal cursor was already
+     * there.  Without this first scroll, the first agent/model output can
+     * overwrite the last visible startup line. */
+    editor_scroll_output_up(ed->output_bottom, 1);
+    ed->output_cursor_saved = false;
+    editor_csi_cursor(ed->output_bottom, 1);
+    editor_save_output_cursor(ed);
+    editor_move_to_prompt_row(ed);
+    return true;
+}
+
+static void editor_restore_terminal_layout(agent_editor *ed) {
+    if (!ed->scroll_region) return;
+    write_all(STDOUT_FILENO, "\x1b[0m", 4);
+    write_all(STDOUT_FILENO, "\x1b[r", 3);
+    editor_csi_cursor(ed->term_rows, 1);
+    write_all(STDOUT_FILENO, "\r\x1b[0K\r\n", 7);
+    ed->scroll_region = false;
+    ed->output_cursor_saved = false;
+    ed->term_rows = ed->term_cols = 0;
+    ed->output_bottom = ed->prompt_row = 0;
+    ed->reserved_rows = 0;
+    ed->output_at_scroll_boundary = false;
+}
+
 /* Start linenoise in nonblocking mode and install the status footer. */
 static int editor_start(agent_editor *ed, const char *prompt,
                         const char *status, const char *initial) {
     char *input = xmalloc(AGENT_INPUT_INITIAL_BUFLEN);
     snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
+    bool had_scroll_region = ed->scroll_region;
+    bool use_scroll_region = editor_configure_scroll_region(ed);
+    if (use_scroll_region) {
+        if (had_scroll_region)
+            editor_set_scroll_layout(ed, 2, true, false);
+        editor_move_to_prompt_row(ed);
+    }
     if (linenoiseEditStart(&ed->edit, STDIN_FILENO, STDOUT_FILENO,
                            input, AGENT_INPUT_INITIAL_BUFLEN, ed->prompt) != 0)
     {
+        editor_restore_terminal_layout(ed);
         free(input);
         return -1;
     }
     linenoiseEditSetStatus(&ed->edit, ed->status,
                            stdout_is_tty() ? AGENT_STATUS_STYLE_START : "",
                            stdout_is_tty() ? AGENT_STATUS_STYLE_END : "");
+    linenoiseEditSetLayoutCallback(&ed->edit, editor_linenoise_layout_changed, ed);
     if (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY")) {
         linenoiseHide(&ed->edit);
         linenoiseShow(&ed->edit);
@@ -5865,10 +6060,8 @@ static void editor_stop(agent_editor *ed) {
      * command scrollback.  Clear it before shutdown so submitting a line and
      * immediately reopening the editor does not leave the accepted
      * prompt+input duplicated above the fresh prompt. */
-    if (!ed->hidden && (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY"))) {
-        linenoiseHide(&ed->edit);
-        ed->hidden = true;
-    }
+    if (!ed->hidden && (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY")))
+        editor_hide(ed);
     linenoiseEditStop(&ed->edit);
     if (ed->old_stdin_flags >= 0) fcntl(STDIN_FILENO, F_SETFL, ed->old_stdin_flags);
     free(ed->edit.buf);
@@ -5884,12 +6077,17 @@ static void editor_stop(agent_editor *ed) {
     ed->paste_tail_len = 0;
 }
 
-/* Hide the live prompt before model output is written.  If the prompt was on a
- * synthetic row below an unfinished model line, move back to the saved output
- * column so the next token continues in the right place. */
+/* Hide the live prompt before model output is written.  In scroll-region mode
+ * the output cursor was saved before the prompt was drawn, so restoring it is
+ * enough to append more model/tool bytes without touching the prompt rows. */
 static void editor_hide(agent_editor *ed) {
     if (!ed->active || ed->hidden) return;
     linenoiseHide(&ed->edit);
+    if (ed->scroll_region) {
+        editor_restore_output_cursor(ed);
+        ed->hidden = true;
+        return;
+    }
     if (ed->prompt_below_output) {
         editor_move_to_output_cursor(ed);
         ed->prompt_below_output = false;
@@ -5897,10 +6095,19 @@ static void editor_hide(agent_editor *ed) {
     ed->hidden = true;
 }
 
-/* Restore the live prompt after output.  For partial model lines the prompt is
- * drawn on the next row, leaving the model line open above it. */
+/* Restore the live prompt after output.  The primary path draws it in the
+ * reserved bottom rows; the fallback path keeps the older one-row-below-output
+ * trick for terminals where scroll regions are unavailable. */
 static void editor_show(agent_editor *ed) {
     if (!ed->active || !ed->hidden) return;
+    if (ed->scroll_region) {
+        editor_save_output_cursor(ed);
+        editor_move_to_prompt_row(ed);
+        write_all(STDOUT_FILENO, "\x1b[0m", 4);
+        linenoiseShow(&ed->edit);
+        ed->hidden = false;
+        return;
+    }
     if (ed->output_line_open) {
         write_all(STDOUT_FILENO, "\r\n", 2);
         ed->prompt_below_output = true;
@@ -5954,32 +6161,33 @@ static void editor_write_async(agent_editor *ed, const char *text, size_t len,
     editor_hide(ed);
     if (len) {
         editor_write_terminal_text(text, len);
-        if (text[len - 1] == '\n' || text[len - 1] == '\r') {
-            ed->output_col = 0;
-            ed->output_line_open = false;
-        } else {
-            int col = 0;
-            if (editor_query_cursor(ed, &col)) {
-                int cols = ed->edit.cols > 0 ? (int)ed->edit.cols : 80;
-                ed->output_col = col > 0 ? col - 1 : 0;
-                ed->output_line_open = true;
-                if (ed->output_col + 1 >= cols) {
-                    write_all(STDOUT_FILENO, "\r\n", 2);
-                    ed->output_col = 0;
-                }
+        if (ed->scroll_region) ed->output_at_scroll_boundary = true;
+        if (!ed->scroll_region) {
+            if (text[len - 1] == '\n' || text[len - 1] == '\r') {
+                ed->output_col = 0;
+                ed->output_line_open = false;
             } else {
-                editor_note_output(ed, text, len);
+                int col = 0;
+                if (editor_query_cursor(ed, &col)) {
+                    int cols = ed->edit.cols > 0 ? (int)ed->edit.cols : 80;
+                    ed->output_col = col > 0 ? col - 1 : 0;
+                    ed->output_line_open = true;
+                    if (ed->output_col + 1 >= cols) {
+                        write_all(STDOUT_FILENO, "\r\n", 2);
+                        ed->output_col = 0;
+                    }
+                } else {
+                    editor_note_output(ed, text, len);
+                }
             }
         }
     }
     if (ed->active) {
         editor_update_prompt(ed, prompt);
         editor_update_status(ed, status);
-        /* When output is in the middle of a line, the prompt lives on the next
-         * terminal row.  Before the next output fragment, editor_hide() clears
-         * the prompt and moves one row up to the saved output column.  This is
-         * the small curses-like trick that lets the user keep typing while the
-         * model continues the previous line above the prompt. */
+        /* In scroll-region mode this saves the current output cursor and
+         * redraws linenoise in the fixed prompt rows.  In fallback mode it may
+         * put the prompt below an unfinished generated line. */
         if (force_show || len) editor_show(ed);
     }
 }
@@ -6007,11 +6215,26 @@ static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
     }
 }
 
-static void agent_print_welcome_banner(const agent_config *cfg) {
+static void agent_format_welcome_banner(const agent_config *cfg,
+                                        char *buf, size_t len) {
     char ctx[32];
     agent_format_ctx_size(cfg->gen.ctx_size, ctx, sizeof(ctx));
-    printf("\n\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
-           ctx);
+    if (stdout_is_tty()) {
+        snprintf(buf, len,
+                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
+                 ctx);
+    } else {
+        snprintf(buf, len, "DwarfStar Agent, context %s tokens\n\n", ctx);
+    }
+}
+
+static void editor_write_welcome_banner(agent_editor *editor,
+                                        const agent_config *cfg,
+                                        const char *prompt,
+                                        const char *statusline) {
+    char banner[256];
+    agent_format_welcome_banner(cfg, banner, sizeof(banner));
+    editor_write_async(editor, banner, strlen(banner), prompt, statusline, true);
 }
 
 /* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
@@ -6112,16 +6335,15 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
     snprintf(hist, sizeof(hist), "%s/.ds4_agent_history", home);
-    /* The agent keeps model output on the row above the live prompt and moves
-     * between output and prompt explicitly.  Multiline editing is still handled
-     * by linenoise itself: hide/show clears and redraws however many terminal
-     * rows the prompt currently occupies. */
+    /* The agent uses ANSI scroll regions when possible: model/tool output
+     * scrolls above the live linenoise prompt and status footer, so streaming
+     * tokens do not require repainting the bottom rows.  Terminals without
+     * scroll-region support fall back to the older prompt-below-output path. */
     linenoiseSetMultiLine(1);
     linenoiseHistorySetMaxLen(512);
     linenoiseHistoryLoad(hist);
     agent_completion_worker = &worker;
     linenoiseSetCompletionCallback(agent_switch_completion_callback);
-    agent_print_welcome_banner(cfg);
 
     agent_status st;
     worker_get_status(&worker, &st);
@@ -6136,12 +6358,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         agent_worker_free(&worker);
         return 1;
     }
+    editor_write_welcome_banner(&editor, cfg, prompt, statusline);
 
     char *initial_pending = cfg->gen.prompt && cfg->gen.prompt[0] ?
                             xstrdup(cfg->gen.prompt) : NULL;
 
     bool running = true;
     bool exit_save_handled = false;
+    bool show_welcome_after_restart = false;
     char *restore_line = NULL;
     while (running) {
         struct pollfd pfd[2] = {
@@ -6241,6 +6465,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                      * where queued user messages should be implemented. */
                     restore_line = xstrdup(cmd);
                 } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
+                    editor_restore_terminal_layout(&editor);
                     if (agent_maybe_save_before_leaving_session(&worker)) {
                         exit_save_handled = true;
                         running = false;
@@ -6288,12 +6513,13 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
                 } else if (!strcmp(cmd, "/new")) {
+                    editor_restore_terminal_layout(&editor);
                     if (agent_maybe_save_before_leaving_session(&worker)) {
                         char err[160] = {0};
                         if (!agent_worker_reset_to_sysprompt(&worker, err, sizeof(err))) {
                             printf("new session failed: %s\n", err);
                         } else {
-                            agent_print_welcome_banner(cfg);
+                            show_welcome_after_restart = true;
                         }
                     }
                 } else if (!strncmp(cmd, "/switch", 7) &&
@@ -6302,15 +6528,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     while (*arg == ' ' || *arg == '\t') arg++;
                     if (!arg[0]) {
                         printf("usage: /switch <sha-prefix>\n");
-                    } else if (agent_maybe_save_before_leaving_session(&worker)) {
-                        char *sha = arg;
-                        while (*arg && *arg != ' ' && *arg != '\t') arg++;
-                        if (*arg) *arg = '\0';
-                        char err[160] = {0};
-                        if (!agent_worker_switch_session(&worker, sha,
-                                                         AGENT_HISTORY_DEFAULT_TURNS,
-                                                         err, sizeof(err)))
-                            printf("switch failed: %s\n", err);
+                    } else {
+                        editor_restore_terminal_layout(&editor);
+                        if (agent_maybe_save_before_leaving_session(&worker)) {
+                            char *sha = arg;
+                            while (*arg && *arg != ' ' && *arg != '\t') arg++;
+                            if (*arg) *arg = '\0';
+                            char err[160] = {0};
+                            if (!agent_worker_switch_session(&worker, sha,
+                                                             AGENT_HISTORY_DEFAULT_TURNS,
+                                                             err, sizeof(err)))
+                                printf("switch failed: %s\n", err);
+                        }
                     }
                 } else if (!strncmp(cmd, "/history", 8) &&
                            (cmd[8] == '\0' || cmd[8] == ' ' || cmd[8] == '\t')) {
@@ -6342,10 +6571,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     build_prompt_text(&st, prompt, sizeof(prompt));
                     build_status_text(&st, statusline, sizeof(statusline));
                     editor_start(&editor, prompt, statusline, restore_line);
-                    if (was_below_output) {
+                    if (!editor.scroll_region && was_below_output) {
                         editor.output_line_open = had_output_line_open;
                         editor.prompt_below_output = was_below_output;
                         editor.output_col = saved_output_col;
+                    }
+                    if (show_welcome_after_restart) {
+                        editor_write_welcome_banner(&editor, cfg, prompt, statusline);
+                        show_welcome_after_restart = false;
                     }
                     free(restore_line);
                     restore_line = NULL;
@@ -6357,6 +6590,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     free(initial_pending);
     free(restore_line);
     editor_stop(&editor);
+    editor_restore_terminal_layout(&editor);
     linenoiseSetCompletionCallback(NULL);
     agent_completion_worker = NULL;
     if (!exit_save_handled)

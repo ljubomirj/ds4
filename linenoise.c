@@ -920,7 +920,7 @@ static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
      * ESC[0K makes an inverse-video status line stop at the text.  Disable
      * autowrap only while writing the footer so painting the last column does
      * not move the cursor to the next row. */
-    abAppend(ab, "\x1b[?7l", 6);
+    abAppend(ab, "\x1b[?7l", 5);
     if (l->status_start) abAppend(ab, l->status_start, (int)strlen(l->status_start));
     width = abAppendUtf8Clipped(ab, l->status, strlen(l->status), cols);
     while (width < cols) {
@@ -928,7 +928,7 @@ static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
         width++;
     }
     if (l->status_end) abAppend(ab, l->status_end, (int)strlen(l->status_end));
-    abAppend(ab, "\x1b[?7h", 6);
+    abAppend(ab, "\x1b[?7h", 5);
 }
 
 /* A fold is a display-only replacement for a range in l->buf. The edited
@@ -1374,6 +1374,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     int rows; /* rows used by current rendered buffer. */
     int rpos = l->oldrpos;   /* cursor relative row from previous refresh. */
     int rpos2; /* rpos after refresh. */
+    int layout_prompt_row = 0; /* Absolute row supplied by layout callback. */
     int col; /* column position, zero-based. */
     int old_rows = l->oldrows;
     int old_status_rows = l->oldstatusrows;
@@ -1385,6 +1386,10 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     bufwidth = utf8StrWidth(render, render_len);
     poswidth = utf8StrWidth(render, render_pos);
     rows = (pwidth+bufwidth+l->cols-1)/l->cols;
+    int cursor_wrap_row = l->pos &&
+        render_pos == render_len &&
+        (poswidth+pwidth) % l->cols == 0;
+    if (cursor_wrap_row) rows++;
 
     /* First step: clear all the lines used before. To do so start by
      * going to the last row. */
@@ -1415,6 +1420,21 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
         }
     }
 
+    /* Some multiplexed users, such as ds4-agent, keep linenoise in a reserved
+     * terminal area below an output scroll region.  The reserved area depends
+     * on how many rows the edited input currently occupies.  Flush the cleanup
+     * phase first, then let the owner resize/reposition the prompt area before
+     * this refresh writes the new prompt. */
+    if ((flags & REFRESH_WRITE) && l->layout_callback) {
+        if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover. */
+        abFree(&ab);
+        abInit(&ab);
+        layout_prompt_row =
+            l->layout_callback(l, (size_t)rows,
+                               linenoiseStatusActive(l) ? 1 : 0,
+                               l->layout_privdata);
+    }
+
     if (flags & REFRESH_ALL) {
         /* Clean the top line. */
         lndebug("clear");
@@ -1441,15 +1461,11 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
 
         /* If we are at the very end of the screen with our prompt, we need to
          * emit a newline and move the prompt to the first column. */
-        if (l->pos &&
-            render_pos == render_len &&
-            (poswidth+pwidth) % l->cols == 0)
-        {
+        if (cursor_wrap_row) {
             lndebug("<newline>");
             abAppend(&ab,"\n",1);
             snprintf(seq,64,"\r");
             abAppend(&ab,seq,strlen(seq));
-            rows++;
         }
 
         /* Move cursor to right position. */
@@ -1460,21 +1476,31 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
             refreshStatusLine(&ab, l);
         }
 
-        /* Go up till we reach the expected position. */
-        int rows_below_cursor = rows - rpos2 + (linenoiseStatusActive(l) ? 1 : 0);
-        if (rows_below_cursor > 0) {
-            lndebug("go-up %d", rows_below_cursor);
-            snprintf(seq,64,"\x1b[%dA", rows_below_cursor);
-            abAppend(&ab,seq,strlen(seq));
-        }
-
         /* Set column. */
         col = (pwidth+poswidth) % l->cols;
-        lndebug("set col %d", 1+col);
-        if (col)
-            snprintf(seq,64,"\r\x1b[%dC", col);
-        else
-            snprintf(seq,64,"\r");
+        if (layout_prompt_row > 0) {
+            /* The owner has explicitly anchored the prompt block.  Avoid the
+             * relative "go up from status row" cursor motion here: after the
+             * scroll-region can grow or shrink, relative movement may be based
+             * on stale physical rows and leave the prompt floating above the
+             * terminal bottom. */
+            snprintf(seq,64,"\x1b[%d;%dH", layout_prompt_row + rpos2 - 1,
+                     1 + col);
+        } else {
+            /* Go up till we reach the expected position. */
+            int rows_below_cursor = rows - rpos2 + (linenoiseStatusActive(l) ? 1 : 0);
+            if (rows_below_cursor > 0) {
+                lndebug("go-up %d", rows_below_cursor);
+                snprintf(seq,64,"\x1b[%dA", rows_below_cursor);
+                abAppend(&ab,seq,strlen(seq));
+            }
+
+            lndebug("set col %d", 1+col);
+            if (col)
+                snprintf(seq,64,"\r\x1b[%dC", col);
+            else
+                snprintf(seq,64,"\r");
+        }
         abAppend(&ab,seq,strlen(seq));
     }
 
@@ -1677,6 +1703,13 @@ oom:
     return -1;
 }
 
+void linenoiseEditSetLayoutCallback(struct linenoiseState *l,
+                                    linenoiseLayoutCallback *fn,
+                                    void *privdata) {
+    l->layout_callback = fn;
+    l->layout_privdata = privdata;
+}
+
 static int linenoiseReadByte(struct linenoiseState *l, char *c) {
     if (l->queued_input_pos < l->queued_input_len) {
         *c = l->queued_input[l->queued_input_pos++];
@@ -1851,6 +1884,8 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->status = NULL;
     l->status_start = NULL;
     l->status_end = NULL;
+    l->layout_callback = NULL;
+    l->layout_privdata = NULL;
     l->queued_input = NULL;
     l->queued_input_len = 0;
     l->queued_input_pos = 0;
