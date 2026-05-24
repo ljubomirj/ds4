@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_kvstore.h"
+#include "ds4_web.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -121,6 +122,12 @@ typedef struct {
     char *out;
     size_t out_len;
     size_t out_cap;
+    ds4_web *web;
+    bool web_approval_pending;
+    bool web_approval_answered;
+    bool web_approval_result;
+    char web_approval_message[256];
+    char web_approval_error[160];
     char more_path[PATH_MAX];
     int more_next_line;
     bool more_bare;
@@ -290,6 +297,9 @@ static agent_worker *agent_completion_worker;
 static void worker_apply_pending_power(agent_worker *w);
 static void agent_trace(agent_worker *w, const char *fmt, ...);
 static void agent_publish_system_status(agent_worker *w, const char *msg);
+static int agent_web_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len);
+static void agent_web_log(void *privdata, const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
@@ -702,7 +712,37 @@ static const char agent_tools_prompt_edit_line[] =
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
+    "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
+    "The first web call may ask the user for permission to start Chrome.\n\n"
     "### Available Tool Schemas\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"google_search\",\n"
+    "    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"query\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"query\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"visit_page\",\n"
+    "    \"description\": \"Open a URL in a visible browser and return rendered page Markdown.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"url\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"url\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -2590,6 +2630,8 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "write")) return "write ";
     if (!strcmp(name, "edit")) return "edit ";
     if (!strcmp(name, "search")) return "search ";
+    if (!strcmp(name, "google_search")) return "google ";
+    if (!strcmp(name, "visit_page")) return "visit ";
     return NULL;
 }
 
@@ -3742,6 +3784,65 @@ static void agent_publish_system_status(agent_worker *w, const char *msg) {
         agent_publish(w, msg, strlen(msg));
         agent_publish(w, "\n", 1);
     }
+}
+
+static int agent_web_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len) {
+    agent_worker *w = privdata;
+    if (!w || w->cfg->non_interactive) {
+        snprintf(err, err_len,
+                 "visible Chrome browser startup requires interactive approval");
+        return 0;
+    }
+
+    pthread_mutex_lock(&w->mu);
+    w->web_approval_pending = true;
+    w->web_approval_answered = false;
+    w->web_approval_result = false;
+    w->web_approval_error[0] = '\0';
+    snprintf(w->web_approval_message, sizeof(w->web_approval_message),
+             "%s", message ? message : "Start visible Chrome browser? (y/n) ");
+    agent_wake_locked(w);
+    while (!w->stop && !w->web_approval_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool ok = w->web_approval_result;
+    if (!ok) {
+        snprintf(err, err_len, "%s",
+                 w->web_approval_error[0] ? w->web_approval_error :
+                 "user denied Chrome browser start");
+    }
+    pthread_mutex_unlock(&w->mu);
+    return ok ? 1 : 0;
+}
+
+static void agent_web_log(void *privdata, const char *message) {
+    agent_worker *w = privdata;
+    if (!w || !message || !message[0]) return;
+    agent_trace(w, "web: %s", message);
+}
+
+static bool worker_take_web_approval_request(agent_worker *w,
+                                             char *message, size_t message_len) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->web_approval_pending;
+    if (pending) {
+        snprintf(message, message_len, "%s", w->web_approval_message);
+        w->web_approval_pending = false;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+static void worker_answer_web_approval(agent_worker *w, bool allow) {
+    pthread_mutex_lock(&w->mu);
+    w->web_approval_result = allow;
+    w->web_approval_answered = true;
+    if (!allow)
+        snprintf(w->web_approval_error, sizeof(w->web_approval_error),
+                 "user denied Chrome browser start");
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
 }
 
 /* Synchronize the live DS4 session to a transcript.  This is the agent's main
@@ -5893,6 +5994,150 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
 }
 
 /* ============================================================================
+ * Browser Web Tools
+ * ============================================================================
+ *
+ * The browser subsystem lives in ds4_web.c: it owns visible Chrome and CDP.  The
+ * agent side only asks for permission, dispatches tools, and caps visit_page
+ * output using the same "head plus temp file" shape as bash.
+ */
+
+#define AGENT_WEB_HEAD_BYTES (8*1024)
+#define AGENT_WEB_HEAD_LINES 100
+
+static int agent_count_lines(const char *s) {
+    if (!s || !s[0]) return 0;
+    int lines = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\n') lines++;
+    }
+    if (s[strlen(s) - 1] != '\n') lines++;
+    return lines;
+}
+
+static char *agent_string_head(const char *s, int max_lines, size_t max_bytes,
+                               int *lines_read, bool *byte_limited) {
+    if (lines_read) *lines_read = 0;
+    if (byte_limited) *byte_limited = false;
+    if (!s) return xstrdup("");
+    size_t used = 0;
+    int lines = 0;
+    while (s[used] && used < max_bytes && lines < max_lines) {
+        if (s[used++] == '\n') lines++;
+    }
+    if (s[used] && used >= max_bytes && byte_limited) *byte_limited = true;
+    if (used && s[used - 1] != '\n' && lines < max_lines) lines++;
+    if (lines_read) *lines_read = lines;
+    return xstrndup(s, used);
+}
+
+static bool agent_write_temp_text(const char *prefix, const char *text,
+                                  char *path, size_t path_len,
+                                  char *err, size_t err_len) {
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/%s_XXXXXX", prefix);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        snprintf(err, err_len, "failed to create temporary file: %s", strerror(errno));
+        return false;
+    }
+    size_t len = text ? strlen(text) : 0;
+    const char *p = text ? text : "";
+    size_t left = len;
+    while (left) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            snprintf(err, err_len, "failed to write temporary file: %s", strerror(errno));
+            close(fd);
+            unlink(tmpl);
+            return false;
+        }
+        p += n;
+        left -= (size_t)n;
+    }
+    if (close(fd) != 0) {
+        snprintf(err, err_len, "failed to close temporary file: %s", strerror(errno));
+        unlink(tmpl);
+        return false;
+    }
+    snprintf(path, path_len, "%s", tmpl);
+    return true;
+}
+
+static char *agent_tool_google_search(agent_worker *w, const agent_tool_call *call) {
+    const char *query = agent_tool_arg_value(call, "query");
+    if (!query || !query[0]) return xstrdup("Tool error: google_search requires query\n");
+    char err[256] = {0};
+    char *md = ds4_web_google_search(w->web, query, err, sizeof(err));
+    if (!md) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: google_search failed: ");
+        agent_buf_puts(&b, err[0] ? err : "unknown error");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    return md;
+}
+
+static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call) {
+    const char *url = agent_tool_arg_value(call, "url");
+    if (!url || !url[0]) return xstrdup("Tool error: visit_page requires url\n");
+    char err[256] = {0};
+    char *md = ds4_web_visit_page(w->web, url, err, sizeof(err));
+    if (!md) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: visit_page failed: ");
+        agent_buf_puts(&b, err[0] ? err : "unknown error");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    char path[PATH_MAX];
+    if (!agent_write_temp_text("ds4_agent_web", md, path, sizeof(path),
+                               err, sizeof(err)))
+    {
+        free(md);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: visit_page failed: ");
+        agent_buf_puts(&b, err[0] ? err : "could not store rendered page");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    int total_lines = agent_count_lines(md);
+    int shown_lines = 0;
+    bool byte_limited = false;
+    char *head = agent_string_head(md, AGENT_WEB_HEAD_LINES, AGENT_WEB_HEAD_BYTES,
+                                   &shown_lines, &byte_limited);
+    bool truncated = byte_limited || shown_lines < total_lines;
+    agent_buf out = {0};
+    char line[PATH_MAX + 256];
+    snprintf(line, sizeof(line),
+             "visit_page url=%s\noutput_path=%s (%zu bytes, %d lines)\n",
+             url, path, strlen(md), total_lines);
+    agent_buf_puts(&out, line);
+    if (truncated) {
+        snprintf(line, sizeof(line), "<head -%d %s>\n",
+                 AGENT_WEB_HEAD_LINES, path);
+        agent_buf_puts(&out, line);
+        agent_buf_puts(&out, head);
+        if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
+        agent_buf_puts(&out, "</head>\n");
+        agent_buf_puts(&out,
+            "Use read path=<output_path> start_line=<line> max_lines=<count> raw=true to inspect more rendered Markdown.\n");
+    } else {
+        agent_buf_puts(&out, "<markdown>\n");
+        agent_buf_puts(&out, head);
+        if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
+        agent_buf_puts(&out, "</markdown>\n");
+    }
+    free(head);
+    free(md);
+    return agent_buf_take(&out);
+}
+
+/* ============================================================================
  * Asynchronous Bash Jobs
  * ============================================================================
  *
@@ -6386,6 +6631,8 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
+    if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
+    if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
 
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
@@ -8423,6 +8670,15 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
                 w->cache_dir, strerror(errno));
         return -1;
     }
+    ds4_web_config web_cfg = {
+        .home_dir = getenv("HOME"),
+        .port = 9333,
+        .confirm = agent_web_confirm,
+        .confirm_privdata = w,
+        .log = agent_web_log,
+        .log_privdata = w,
+    };
+    w->web = ds4_web_create(&web_cfg);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -8442,6 +8698,7 @@ static void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
+    ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     free(w->cache_dir);
@@ -8775,6 +9032,26 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             pthread_mutex_unlock(&worker.mu);
         }
         free(out);
+
+        char web_approval_msg[256];
+        if (worker_take_web_approval_request(&worker, web_approval_msg,
+                                             sizeof(web_approval_msg)))
+        {
+            char *saved_input = NULL;
+            if (editor.active && editor.edit.buf && editor.edit.len)
+                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
+            editor_stop(&editor);
+            editor_restore_terminal_layout(&editor);
+            bool allow = agent_prompt_yes_no(web_approval_msg);
+            worker_answer_web_approval(&worker, allow);
+            worker_get_status(&worker, &st);
+            build_prompt_text(&st, prompt, sizeof(prompt));
+            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
+            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            editor_start(&editor, prompt, statusline, saved_input);
+            free(saved_input);
+            continue;
+        }
 
         if (initial_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {
