@@ -584,6 +584,7 @@ typedef struct {
     api_style api;
     ds4_tokens prompt;
     char *model;
+    bool model_from_request;
     stop_list stops;
     char *raw_body;
     char *prompt_text;
@@ -888,6 +889,17 @@ static bool model_alias_disables_thinking(const char *model) {
 
 static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
+}
+
+static const char *server_model_id_from_engine(ds4_engine *engine) {
+    return ds4_engine_model_id(engine) == 1 ?
+           "deepseek-v4-pro" : "deepseek-v4-flash";
+}
+
+static bool server_model_alias_known(const char *id) {
+    return id &&
+           (!strcmp(id, "deepseek-v4-flash") ||
+            !strcmp(id, "deepseek-v4-pro"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2664,6 +2676,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -2874,6 +2887,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -3775,6 +3789,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -3992,6 +4007,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -11017,14 +11033,20 @@ typedef struct {
     int fd;
 } client_arg;
 
-static void append_model_json_values(buf *b, int ctx, int default_tokens) {
+static void append_model_json_values(buf *b, const char *id, const char *name,
+                                     int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
-        "{\"id\":\"deepseek-v4-flash\","
-        "\"object\":\"model\","
+        "{\"id\":");
+    json_escape(b, id);
+    buf_puts(b,
+        ",\"object\":\"model\","
         "\"created\":1767225600,"
         "\"owned_by\":\"ds4.c\","
-        "\"name\":\"DeepSeek V4 Flash\","
+        "\"name\":");
+    json_escape(b, name);
+    buf_printf(b,
+        ","
         "\"context_length\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
@@ -11047,13 +11069,17 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
         max_completion);
 }
 
-static void append_model_json(buf *b, const server *s) {
-    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+static void append_model_json(buf *b, const server *s, const char *id) {
+    append_model_json_values(b,
+                             id,
+                             ds4_engine_model_name(s->engine),
+                             ds4_session_ctx(s->session),
+                             s->default_tokens);
 }
 
-static bool send_model(server *s, int fd) {
+static bool send_model(server *s, int fd, const char *id) {
     buf b = {0};
-    append_model_json(&b, s);
+    append_model_json(&b, s, id);
     buf_putc(&b, '\n');
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -11063,7 +11089,9 @@ static bool send_model(server *s, int fd) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s);
+    append_model_json(&b, s, "deepseek-v4-flash");
+    buf_putc(&b, ',');
+    append_model_json(&b, s, "deepseek-v4-pro");
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -11102,8 +11130,13 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
-        send_model(s, fd);
+    const char *model_path_prefix = "/v1/models/";
+    const size_t model_path_prefix_len = strlen(model_path_prefix);
+    if (!strcmp(hr.method, "GET") &&
+        !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
+        server_model_alias_known(hr.path + model_path_prefix_len))
+    {
+        send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
         goto done;
     }
@@ -11134,6 +11167,10 @@ static void *client_main(void *arg) {
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
         goto done;
+    }
+    if (!req.model_from_request) {
+        free(req.model);
+        req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -14304,12 +14341,18 @@ static void test_json_skip_has_nesting_limit(void) {
 
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
-    append_model_json_values(&b, 32768, 393216);
+    append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
+                             32768, 393216);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     buf_free(&b);
 
-    append_model_json_values(&b, 100000, 4096);
+    append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
+                             100000, 4096);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
