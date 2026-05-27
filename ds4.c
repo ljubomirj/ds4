@@ -224,6 +224,14 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* REAP-compact support: per-layer expert counts for models with REAP pruning.
+ * REAP25 models have 256 experts in hash-preserved layers (0-2) and 192 experts
+ * in pruned layers (3-42). This array stores the actual expert count per layer. */
+static uint32_t g_reap_layer_expert_count[DS4_MAX_LAYER];
+
+/* Forward declaration for REAP support */
+static uint32_t reap_layer_expert_count(uint32_t il);
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .variant = DS4_VARIANT_FLASH,
@@ -2627,11 +2635,14 @@ static void weights_validate_layout(const ds4_weights *w) {
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+
+        /* REAP support: use per-layer expert count */
+        const uint32_t n_expert = reap_layer_expert_count(il);
+        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, n_expert, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, n_expert, 0, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -2678,11 +2689,14 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
     tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
     tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+
+    /* MTP uses a single block; use layer 0 expert count for validation */
+    const uint32_t n_expert = reap_layer_expert_count(0);
+    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, n_expert, 0);
+    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, n_expert, 0, 0);
+    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
     if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
         ds4_die("MTP routed gate/up experts use different quant types");
     }
@@ -2797,6 +2811,118 @@ static void ds4_select_shape_from_metadata(
             n_ff_exp,
             n_indexer_top_k);
     exit(1);
+}
+
+/* =========================================================================
+ * REAP-Compact GGUF Support
+ * =========================================================================
+ *
+ * REAP (Router-weighted Expert Activation Pruning) removes low-utility experts
+ * from MoE models. REAP25 prunes 25% of experts (256->192) while maintaining quality.
+ *
+ * REAP-compact models have different expert counts per layer:
+ * - Layers 0-2: 256 experts (hash-preserved layers)
+ * - Layers 3-42: 192 experts (REAP-pruned layers)
+ *
+ * The GGUF metadata stores the original expert count, so we infer the actual
+ * per-layer counts from tensor dimensions.
+ */
+
+static void reap_init_layer_expert_counts(void) {
+    /* Initialize all layers to the default expert count from the shape */
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        g_reap_layer_expert_count[il] = g_ds4_shape.n_expert;
+    }
+}
+
+static void reap_read_metadata(const ds4_model *m) {
+    /* First, initialize with default values */
+    reap_init_layer_expert_counts();
+
+    /* Check if REAP is enabled */
+    bool reap_enabled = false;
+    if (!model_get_bool(m, "reap.enabled", &reap_enabled) || !reap_enabled) {
+        return;  /* Not a REAP model, use defaults */
+    }
+
+    fprintf(stderr, "ds4: REAP enabled, inferring per-layer expert counts...\n");
+
+    /* Read the actual expert counts from tensor dimensions.
+     * The reap.layer.expert_count metadata contains the original count (256),
+     * not the actual compacted count. We need to check the tensors directly. */
+
+    /* Get baseline expert count from layer 0 (always full count) */
+    const ds4_tensor *layer_0_gate = model_find_tensor(m, "blk.0.ffn_gate_inp.weight");
+    if (!layer_0_gate || layer_0_gate->ndim != 2 || layer_0_gate->dim[1] > DS4_MAX_EXPERT) {
+        fprintf(stderr, "ds4: REAP model has invalid layer 0 ffn_gate_inp tensor\n");
+        exit(1);
+    }
+    const uint32_t baseline_expert_count = (uint32_t)layer_0_gate->dim[1];
+
+    /* Check layer 3 to see if compaction is applied */
+    const ds4_tensor *layer_3_gate = model_find_tensor(m, "blk.3.ffn_gate_inp.weight");
+    if (!layer_3_gate || layer_3_gate->ndim != 2) {
+        fprintf(stderr, "ds4: REAP model has invalid layer 3 ffn_gate_inp tensor\n");
+        exit(1);
+    }
+    const uint32_t compacted_expert_count = (uint32_t)layer_3_gate->dim[1];
+
+    fprintf(stderr, "ds4: REAP baseline expert count (layer 0): %u\n", baseline_expert_count);
+    fprintf(stderr, "ds4: REAP compacted expert count (layer 3): %u\n", compacted_expert_count);
+
+    /* If all layers have the same count, no REAP compaction */
+    if (baseline_expert_count == compacted_expert_count) {
+        fprintf(stderr, "ds4: REAP enabled but no per-layer expert count variation detected\n");
+        return;
+    }
+
+    /* Determine hash_preserved: number of layers with baseline expert count */
+    uint32_t hash_preserved = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char name[128];
+        snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", il);
+        const ds4_tensor *t = model_find_tensor(m, name);
+        if (t && t->ndim == 2 && (uint32_t)t->dim[1] == baseline_expert_count) {
+            hash_preserved++;
+        } else {
+            break;  /* Found first compacted layer */
+        }
+    }
+
+    fprintf(stderr, "ds4: REAP hash_preserved=%u\n", hash_preserved);
+
+    /* Set per-layer expert counts */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (il < hash_preserved) {
+            g_reap_layer_expert_count[il] = baseline_expert_count;
+        } else {
+            g_reap_layer_expert_count[il] = compacted_expert_count;
+        }
+    }
+
+    /* Read and log REAP layout string */
+    ds4_array_ref layout_arr;
+    if (model_get_array(m, "reap.layout", &layout_arr)) {
+        if (layout_arr.type == GGUF_VALUE_STRING) {
+            ds4_cursor lc = cursor_at(m, layout_arr.data_pos);
+            uint64_t str_len = 0;
+            if (cursor_u64(&lc, &str_len) && str_len < 128) {
+                char layout_str[128];
+                if (cursor_read(&lc, layout_str, str_len)) {
+                    layout_str[str_len] = '\0';
+                    fprintf(stderr, "ds4: REAP layout=%s\n", layout_str);
+                }
+            }
+        }
+    }
+}
+
+/* Get the expert count for a specific layer, accounting for REAP compaction */
+static inline uint32_t reap_layer_expert_count(uint32_t il) {
+    if (il >= DS4_MAX_LAYER) {
+        ds4_die("layer index out of range in reap_layer_expert_count");
+    }
+    return g_reap_layer_expert_count[il];
 }
 
 static void validate_compress_ratio_metadata(const ds4_model *m) {
@@ -2941,6 +3067,9 @@ static void config_validate_model(const ds4_model *m) {
                                    n_indexer_top_k,
                                    n_hc,
                                    n_hc_sinkhorn_iter);
+
+    /* Read REAP metadata for compact models after shape is set */
+    reap_read_metadata(m);
 
     config_expect_u32("embedding_length",            n_embd,         DS4_N_EMBD);
     config_expect_u32("vocab_size",                  n_vocab,        DS4_N_VOCAB);
@@ -5613,11 +5742,13 @@ static void layer_router_probs_one(
         float             probs[DS4_MAX_EXPERT],
         const ds4_model   * model,
         const ds4_layer_weights * layer,
-        const float       * x) {
+        const float       * x,
+        uint32_t            il) {
     float logits[DS4_MAX_EXPERT];
 
     matvec_f16(logits, model, layer->ffn_gate_inp, x);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+    const uint32_t n_expert = reap_layer_expert_count(il);
+    for (uint32_t i = 0; i < n_expert; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
 }
@@ -5625,10 +5756,12 @@ static void layer_router_probs_one(
 static void layer_hash_router_weights_from_probs(
         float             weights_out[DS4_MAX_EXPERT_USED],
         const float       probs[DS4_MAX_EXPERT],
-        const int          selected[DS4_MAX_EXPERT_USED]) {
+        const int          selected[DS4_MAX_EXPERT_USED],
+        uint32_t            il) {
+    const uint32_t n_expert = reap_layer_expert_count(il);
     float sum = 0.0f;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) ds4_die("hash-selected expert is outside router range");
+        if (selected[i] < 0 || (uint32_t)selected[i] >= n_expert) ds4_die("hash-selected expert is outside router range");
         weights_out[i] = probs[selected[i]];
         sum += weights_out[i];
     }
@@ -5644,11 +5777,12 @@ static void layer_hash_router_weights_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * x,
-        const int          selected[DS4_MAX_EXPERT_USED]) {
+        const int          selected[DS4_MAX_EXPERT_USED],
+        uint32_t            il) {
     float probs[DS4_MAX_EXPERT];
 
-    layer_router_probs_one(probs, model, layer, x);
-    layer_hash_router_weights_from_probs(weights_out, probs, selected);
+    layer_router_probs_one(probs, model, layer, x, il);
+    layer_hash_router_weights_from_probs(weights_out, probs, selected, il);
 }
 
 static void topk_desc(const float *score, int n, int k, int *idx) {
@@ -5672,18 +5806,20 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]);
+        const float           probs[DS4_MAX_EXPERT],
+        uint32_t               il);
 
 static void layer_topk_selected_experts(
         int                    selected[DS4_MAX_EXPERT_USED],
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           *x) {
+        const float           *x,
+        uint32_t               il) {
     float probs[DS4_MAX_EXPERT];
 
-    layer_router_probs_one(probs, model, layer, x);
-    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    layer_router_probs_one(probs, model, layer, x, il);
+    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs, il);
 }
 
 static void layer_topk_selected_experts_from_probs(
@@ -5691,17 +5827,19 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]) {
+        const float           probs[DS4_MAX_EXPERT],
+        uint32_t               il) {
+    const uint32_t n_expert = reap_layer_expert_count(il);
     float selection[DS4_MAX_EXPERT];
 
-    memcpy(selection, probs, sizeof(selection));
+    memcpy(selection, probs, n_expert * sizeof(selection[0]));
 
     if (layer->ffn_exp_probs_b) {
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
-        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
+        for (uint32_t i = 0; i < n_expert; i++) selection[i] += bias[i];
     }
 
-    topk_desc(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected);
+    topk_desc(selection, (int)n_expert, (int)DS4_N_EXPERT_USED, selected);
 
     float sum = 0.0f;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
@@ -5746,9 +5884,9 @@ static void layer_routed_moe_one(
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, x, selected, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
 
     if (!trace) {
@@ -5840,9 +5978,9 @@ static void layer_routed_moe_one_prealloc(
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, x, selected, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -5906,9 +6044,9 @@ static void layer_routed_moe_batch(
         float weights[DS4_MAX_EXPERT_USED];
         if (layer->ffn_gate_tid2eid) {
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
-            layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
+            layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel, il);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim, il);
         }
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
@@ -10937,9 +11075,9 @@ static void metal_graph_trace_layer_stages(
                                   routed_midq);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, il);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
@@ -11161,9 +11299,9 @@ static int metal_graph_decode_test(
                                   routed_midq);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected, 0);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, 0);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
