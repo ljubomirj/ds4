@@ -61,6 +61,39 @@ ds4: REAP hash_preserved=3
 ds4: REAP layout=ds4-compact-v1
 ```
 
+## Performance Benchmarks
+
+**Test System**: 2023 MacBook Pro M2 Max, 96GB RAM, macOS, Metal backend
+
+**Memory Usage**:
+- Mapped: ~65.4 GB at ctx=2048 (vs ~82 GB stock)
+- Savings: ~17 GB (16.9 GB file size reduction)
+
+**Speed Benchmark Results**:
+
+| Context | Prefill (t/s) | Generation (t/s) | KV Cache |
+|---------|---------------|-------------------|----------|
+| 2K | 284.11 | 17.52 | 52 GB |
+| 4K | 234.42 | 15.53 | 80 GB |
+| 8K | 220.39 | 14.88 | 137 GB |
+| 16K | 199.10 | 13.86 | 250 GB |
+| 32K | 157.99 | 12.85 | 475 GB |
+| 48K | 135.82 | 11.80 | 672 GB |
+| 61K | 125.54 | 11.50 | 842 GB |
+
+**Benchmark Command**:
+```bash
+./ds4-bench \
+  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 65536 \
+  --step-incr 2048 \
+  --gen-tokens 128
+```
+
+**Conclusion**: REAP-compact maintains full inference speed while saving ~17GB of memory, enabling 96GB RAM machines to run DeepSeek V4 Flash comfortably at 32K+ context.
+
 ## This Branch
 
 - **Branch**: [`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support)
