@@ -1,3 +1,86 @@
+# REAP-Compact GGUF Support Branch
+
+> **This is the `reap-compact-support` branch** of [ljubomirj/ds4](https://github.com/ljubomirj/ds4), enabling support for REAP-compact GGUF models.
+
+## What This Branch Does
+
+This branch adds support for **REAP-compact GGUF models** to the DS4 inference engine. REAP (Router-weighted Expert Activation Pruning) removes low-utility experts from MoE models while maintaining quality. **REAP25** prunes 25% of experts (256→192 per layer), enabling DeepSeek V4 Flash to run on 96GB RAM machines with ~17GB memory savings.
+
+### Key Changes
+
+- Per-layer expert count tracking (layers 0-2: 256 experts, layers 3-42: 192 experts)
+- REAP metadata reader that infers expert counts from tensor dimensions
+- Updated validation and routing to use per-layer expert counts
+- Fully backward compatible with stock models
+
+## Model File
+
+This branch uses the **REAP25-LCB50-DS4-compact** GGUF model:
+
+**Source**: [eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4)
+
+> Special thanks to **eouya2** for creating the REAP-compact GGUF with DS4-compact layout and LiveCodeBench calibration.
+
+**Model**: `DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf`
+- File size: 63.87 GiB (vs 80.76 GiB stock)
+- Memory at ctx=512: ~65GB (vs ~82GB stock)
+- Pruning: 25% of experts (256 → 192)
+
+## Build and Usage
+
+### Building
+
+```bash
+cd ~/ds4/github/worktrees/reap-compact
+make
+```
+
+### Running
+
+```bash
+# Basic inference
+./ds4 -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+       --ctx 32768 --nothink --temp 0 -n 64 \
+       -p 'write a python function to merge two sorted lists'
+
+# Server mode
+./ds4-server \
+  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+  --ctx 32768 --tokens 1024 \
+  --host 127.0.0.1 --port 8000
+```
+
+### Verification
+
+The model loads with REAP detection:
+```
+ds4: REAP enabled, inferring per-layer expert counts...
+ds4: REAP baseline expert count (layer 0): 256
+ds4: REAP compacted expert count (layer 3): 192
+ds4: REAP hash_preserved=3
+ds4: REAP layout=ds4-compact-v1
+```
+
+## This Branch
+
+- **Branch**: [`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support)
+- **Fork**: [ljubomirj/ds4](https://github.com/ljubomirj/ds4)
+- **Based on**: [antirez/ds4](https://github.com/antirez/ds4) (upstream)
+
+## Acknowledgments
+
+### Original Projects
+
+- **[DS4 by antirez](https://github.com/antirez/ds4)** - The original DeepSeek V4 Flash inference engine. Excellent architecture that made this adaptation straightforward.
+- **[REAP Research by Cerebras](https://github.com/CerebrasResearch/reap)** - Router-weighted Expert Activation Pruning methodology.
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** - GGUF format, quantization, and kernel implementations.
+
+### REAP-Compact Model
+
+- **[eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4)** - REAP-pruned GGUF with DS4-compact layout, LiveCodeBench calibration, and bundled runtime.
+
+---
+
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
