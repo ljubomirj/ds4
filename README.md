@@ -120,32 +120,33 @@ MTP uses layer 0's expert count for validation. Since REAP preserves layers 0-2 
 
 ### MTP Performance Testing
 
-**Test Commands**:
-```bash
-# Baseline (no MTP)
-./ds4 \
-  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
-  --ctx 4096 --nothink --temp 0 -n 128 \
-  -p "Write a Python function to merge two sorted lists."
+**Test System**: M2 Max 96GB RAM, macOS, Metal backend
+**Test**: 128 token generation at ctx=4096
 
-# With MTP (draft=2)
-./ds4 \
-  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
-  --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
-  --mtp-draft 2 \
-  --ctx 4096 --nothink --temp 0 -n 128 \
-  -p "Write a Python function to merge two sorted lists."
-```
+**Comprehensive Benchmark** (all MTP draft values):
+| MTP Draft | Prefill (t/s) | Generation (t/s) | Recommendation |
+|-----------|---------------|-----------------|----------------|
+| 0 (none) | 50.14 | **21.40** | ✅ **Fastest** |
+| 1 | 49.70 | 19.52 | Slower |
+| 2 | 38.36 | 20.13 | Slower |
+| 3 | 36.95 | 12.56 | ❌ **Significantly slower** |
 
-**Results**:
-| Configuration | Generation (t/s) |
-|---------------|-----------------|
-| REAP only | 21.92 |
-| REAP + MTP (draft=2) | 21.62 |
+**Benchmark Script**: See `~/ds4/bench-mtp-reap.sh` for reproducible testing.
 
-**Conclusion**: MTP provides minimal speedup with REAP, consistent with upstream DS4 documentation which states MTP is "experimental" and provides "at most a slight speedup, not a meaningful generation-speed win."
+### Recommendation: Do NOT Use MTP
 
-**For Upstream Adoption**: MTP compatibility is important for feature completeness, even if performance gains are minimal. The branch supports all DS4 features.
+**MTP provides no speedup with REAP-compact** and actually slows down generation:
+- Draft 0 (no MTP) is the fastest configuration
+- Higher draft values progressively slow down both prefill and generation
+- Draft 3 (max speculation) reduces generation speed by ~40%
+
+**Why MTP Doesn't Help**:
+1. MTP is experimental per upstream DS4 documentation
+2. Correctness-gated speculation rejects low-confidence predictions
+3. Overhead exceeds benefits for this model/configuration
+4. Designed for greedy decoding scenarios
+
+**For Upstream Adoption**: MTP compatibility is still important for feature completeness, even though we recommend not using it. The branch fully supports MTP - users can choose to enable it, but our benchmarks show no performance benefit.
 
 ## Agent Usage Example
 
@@ -154,19 +155,33 @@ For running agents with REAP-compact model, create a startup script:
 ```bash
 #!/bin/bash
 # Start ds4-agent with REAP-compact model
+#
+# Usage: ./start-reap-agent.sh [prompt]
+#
+# Environment: 96GB RAM M2 Max, macOS Metal backend
+#
+# Context depth testing for real agent tasks
+
 MODEL_PATH="$HOME/ds4/gguf/DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf"
 WORKTREE="$HOME/ds4/github/worktrees/reap-compact"
+SERVER_BIN="$WORKTREE/ds4-agent"
 
 cd "$WORKTREE" || exit 1
 
-./ds4-agent \
-  -m "$MODEL_PATH" \
-  --ctx 1048576 \
-  --tokens 65536 \
-  --nothink \
-  --temp 0 \
-  --backend metal \
-  "$@"
+SERVER_ARGS=(
+  -m "$MODEL_PATH"
+  --ctx 1048576         # 1M context
+  --tokens 65536        # max output
+  --nothink
+  --temp 0
+  --top-p 0.9
+  --min-p 0.05
+  --backend metal
+)
+
+CMD="$SERVER_BIN ${SERVER_ARGS[@]} $@"
+echo "$0 running: $CMD"
+eval "$CMD"
 ```
 
 This provides 1M token context for extended agent sessions with REAP memory efficiency.
