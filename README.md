@@ -1,5 +1,9 @@
 # DwarfStar
 
+> **Fork of [antirez/ds4](https://github.com/antirez/ds4)** — additional branches:
+> [`l26f`](https://github.com/ljubomirj/ds4/tree/l26f) (Ling-2.6-Flash),
+> [`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support) (REAP-compact GGUF)
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
 machines. It is
