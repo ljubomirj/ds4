@@ -1,5 +1,18 @@
 # ds4.c
 
+> **Note:** This is a fork of [antirez/ds4](https://github.com/antirez/ds4) with additional feature branches.
+
+## Fork Branches
+
+This fork contains two feature branches:
+
+1. **[`l26f`](https://github.com/ljubomirj/ds4/tree/l26f)** - Support for Ling-2.6-Flash model
+2. **[`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support)** - REAP-compact GGUF support (25% expert pruning for 96GB RAM machines)
+
+See [upstream ds4](https://github.com/antirez/ds4) for the original project.
+
+---
+
 `ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
