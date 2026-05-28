@@ -94,6 +94,83 @@ ds4: REAP layout=ds4-compact-v1
 
 **Conclusion**: REAP-compact maintains full inference speed while saving ~17GB of memory, enabling 96GB RAM machines to run DeepSeek V4 Flash comfortably at 32K+ context.
 
+## MTP (Multi-Token Prediction) Support
+
+**Compatibility**: ✅ REAP-compact is fully compatible with MTP speculative decoding.
+
+### Technical Details
+
+MTP uses layer 0's expert count for validation. Since REAP preserves layers 0-2 at 256 experts (hash-routed), MTP works correctly with REAP-compact models.
+
+### MTP Model
+
+**Source**: Available in the main DS4 repository (use `./download_model.sh mtp`)
+
+**Model**: `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`
+- File size: ~3.5 GB
+- Purpose: Speculative decoding via draft-token predictions
+
+### Memory with MTP
+
+| Configuration | Memory |
+|---------------|---------|
+| REAP only | ~65 GB |
+| REAP + MTP | ~69 GB (+3.6 GB) |
+| **Available for KV** | ~27 GB (of 96 GB total) |
+
+### MTP Performance Testing
+
+**Test Commands**:
+```bash
+# Baseline (no MTP)
+./ds4 \
+  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+  --ctx 4096 --nothink --temp 0 -n 128 \
+  -p "Write a Python function to merge two sorted lists."
+
+# With MTP (draft=2)
+./ds4 \
+  -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+  --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  --mtp-draft 2 \
+  --ctx 4096 --nothink --temp 0 -n 128 \
+  -p "Write a Python function to merge two sorted lists."
+```
+
+**Results**:
+| Configuration | Generation (t/s) |
+|---------------|-----------------|
+| REAP only | 21.92 |
+| REAP + MTP (draft=2) | 21.62 |
+
+**Conclusion**: MTP provides minimal speedup with REAP, consistent with upstream DS4 documentation which states MTP is "experimental" and provides "at most a slight speedup, not a meaningful generation-speed win."
+
+**For Upstream Adoption**: MTP compatibility is important for feature completeness, even if performance gains are minimal. The branch supports all DS4 features.
+
+## Agent Usage Example
+
+For running agents with REAP-compact model, create a startup script:
+
+```bash
+#!/bin/bash
+# Start ds4-agent with REAP-compact model
+MODEL_PATH="$HOME/ds4/gguf/DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf"
+WORKTREE="$HOME/ds4/github/worktrees/reap-compact"
+
+cd "$WORKTREE" || exit 1
+
+./ds4-agent \
+  -m "$MODEL_PATH" \
+  --ctx 1048576 \
+  --tokens 65536 \
+  --nothink \
+  --temp 0 \
+  --backend metal \
+  "$@"
+```
+
+This provides 1M token context for extended agent sessions with REAP memory efficiency.
+
 ## This Branch
 
 - **Branch**: [`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support)
