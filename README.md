@@ -94,6 +94,60 @@ ds4: REAP layout=ds4-compact-v1
 
 **Conclusion**: REAP-compact maintains full inference speed while saving ~17GB of memory, enabling 96GB RAM machines to run DeepSeek V4 Flash comfortably at 32K+ context.
 
+### Context Depth Benchmarks (via llama-benchy)
+
+**Test Method**: Server API benchmarking using [llama-benchy](https://github.com/ggerganov/llama.cpp/tree/master/contrib/llama-benchy) against ds4-server OpenAI-compatible API.
+
+**Server Configuration**:
+```bash
+#!/bin/bash
+MODEL_PATH="$HOME/ds4/gguf/DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf"
+WORKTREE="$HOME/ds4/github/worktrees/reap-compact"
+
+./ds4-server \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -m "$MODEL_PATH" \
+  --ctx 1048576 \
+  --tokens 65536 \
+  --backend metal
+```
+
+**Benchmark Command**:
+```bash
+llama-benchy \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model deepseek-v4-flash \
+  --tokenizer Qwen/Qwen2.5-7B-Instruct \
+  --depth 1024 8192 32768 65536 131072 \
+  --pp 2048 \
+  --tg 128 \
+  --runs 1 \
+  --latency-mode none \
+  --no-warmup \
+  --save-result ~/llama.cpp/contrib/llama-benchy/results/reap-compact-depth-test-20260528-233816.md \
+  --format md
+```
+
+**Results** (M2 Max 96GB, Metal backend):
+
+| Context Depth | PP t/s | TG t/s | Peak TG t/s | E2E TTFT (s) | Total Time (s) |
+|---------------|--------|--------|-------------|--------------|-----------------|
+| 1K (1024) | 196.44 | 32.63 | 39.00 | 16.66 | ~17s |
+| 8K (8192) | 221.65 | 30.19 | 35.00 | 49.30 | ~49s |
+| 32K (32768) | 206.86 | 26.45 | 35.00 | 176.44 | ~176s (~3 min) |
+| 64K (65536) | 176.38 | 23.67 | 34.00 | 400.27 | ~400s (~6.7 min) |
+| 128K (131072) | 142.94 | 21.84 | 29.00 | 971.89 | ~972s (~16 min) |
+
+**Key Observations**:
+- **Best PP**: 8K context (221.65 t/s)
+- **Best TG**: 1K context (32.63 t/s)
+- **PP degradation**: 36% from 8K peak to 128K
+- **TG degradation**: 33% from 1K to 128K
+- Token generation stays above 21 t/s even at 128K context
+
+The REAP-compact model shows **graceful degradation** - performance remains usable even at extreme context depths.
+
 ## MTP (Multi-Token Prediction) Support
 
 **Compatibility**: ✅ REAP-compact is fully compatible with MTP speculative decoding.
