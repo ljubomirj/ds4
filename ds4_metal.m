@@ -58,6 +58,20 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder);
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLSharedEvent> g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
+static int g_selected_readback_summary_initialized;
+static int g_selected_readback_summary_enabled;
+static uint64_t g_selected_summary_routed_moe_calls;
+static uint64_t g_selected_summary_generic_id_path;
+static uint64_t g_selected_summary_selected_slots_path;
+static uint64_t g_selected_summary_source_readback;
+static uint64_t g_selected_summary_source_override;
+static uint64_t g_selected_summary_source_replay;
+static uint64_t g_selected_summary_source_gpu_full_addr;
+static uint64_t g_selected_summary_source_validator;
+static uint64_t g_selected_summary_source_other;
+static uint64_t g_selected_summary_commit_wait_calls;
+static uint64_t g_selected_summary_wait_ready_calls;
+static uint64_t g_selected_summary_signal_wait_calls;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f16_pipeline;
@@ -708,6 +722,59 @@ static id<MTLBuffer> g_stream_compact_down_addr_buffers[DS4_METAL_STREAM_EXPERT_
 static id<MTLBuffer> g_stream_compact_selected_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_selected_id_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_validate_status_buffer;
+
+static void ds4_gpu_selected_readback_summary_print(void) {
+    if (!g_selected_readback_summary_enabled) return;
+    fprintf(stderr,
+            "ds4: selected-readback summary "
+            "routed_moe_calls=%llu generic_id=%llu selected_slots=%llu "
+            "source_readback=%llu source_override=%llu source_replay=%llu "
+            "source_gpu_full_addr=%llu source_validator=%llu source_other=%llu "
+            "commit_wait=%llu wait_ready=%llu signal_wait=%llu\n",
+            (unsigned long long)g_selected_summary_routed_moe_calls,
+            (unsigned long long)g_selected_summary_generic_id_path,
+            (unsigned long long)g_selected_summary_selected_slots_path,
+            (unsigned long long)g_selected_summary_source_readback,
+            (unsigned long long)g_selected_summary_source_override,
+            (unsigned long long)g_selected_summary_source_replay,
+            (unsigned long long)g_selected_summary_source_gpu_full_addr,
+            (unsigned long long)g_selected_summary_source_validator,
+            (unsigned long long)g_selected_summary_source_other,
+            (unsigned long long)g_selected_summary_commit_wait_calls,
+            (unsigned long long)g_selected_summary_wait_ready_calls,
+            (unsigned long long)g_selected_summary_signal_wait_calls);
+}
+
+static int ds4_gpu_selected_readback_summary_active(void) {
+    if (!g_selected_readback_summary_initialized) {
+        g_selected_readback_summary_initialized = 1;
+        g_selected_readback_summary_enabled =
+            getenv("DS4_METAL_SELECTED_READBACK_SUMMARY") != NULL;
+        if (g_selected_readback_summary_enabled) {
+            atexit(ds4_gpu_selected_readback_summary_print);
+        }
+    }
+    return g_selected_readback_summary_enabled;
+}
+
+static void ds4_gpu_selected_readback_summary_note_source(const char *source) {
+    if (!ds4_gpu_selected_readback_summary_active()) return;
+    if (!source) {
+        g_selected_summary_source_other++;
+    } else if (strcmp(source, "readback") == 0) {
+        g_selected_summary_source_readback++;
+    } else if (strcmp(source, "override") == 0) {
+        g_selected_summary_source_override++;
+    } else if (strcmp(source, "replay") == 0) {
+        g_selected_summary_source_replay++;
+    } else if (strcmp(source, "gpu-full-addr") == 0) {
+        g_selected_summary_source_gpu_full_addr++;
+    } else if (strncmp(source, "validator-", 10) == 0) {
+        g_selected_summary_source_validator++;
+    } else {
+        g_selected_summary_source_other++;
+    }
+}
 
 @interface DS4MetalTensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -9364,6 +9431,9 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb || event_value == 0) return 0;
+    if (ds4_gpu_selected_readback_summary_active()) {
+        g_selected_summary_commit_wait_calls++;
+    }
 
     if (@available(macOS 12.0, *)) {
         if (!g_selected_readback_event) return 0;
@@ -9983,6 +10053,9 @@ int ds4_gpu_tp_failed(void) {
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (event_value == 0) return 0;
+    if (ds4_gpu_selected_readback_summary_active()) {
+        g_selected_summary_wait_ready_calls++;
+    }
 
     if (@available(macOS 12.0, *)) {
         if (!g_selected_readback_event) return 0;
@@ -10005,6 +10078,9 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
+    if (ds4_gpu_selected_readback_summary_active()) {
+        g_selected_summary_signal_wait_calls++;
+    }
 
     if (@available(macOS 12.0, *)) {
         if (!g_selected_readback_event) {
@@ -38397,6 +38473,14 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool use_selected_slots =
             use_q4_selected_slots || use_iq2_selected_slots ||
             use_mxfp4_selected_slots || use_iq2_stream_addr_table;
+        if (ds4_gpu_selected_readback_summary_active()) {
+            g_selected_summary_routed_moe_calls++;
+            if (use_selected_slots) {
+                g_selected_summary_selected_slots_path++;
+            } else {
+                g_selected_summary_generic_id_path++;
+            }
+        }
         id<MTLComputePipelineState> slots_pair_swiglu_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline :
@@ -38904,6 +38988,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 selected_read_ms = selected_sync_ms + selected_copy_ms;
                 selected_t0 = ds4_gpu_now_ms();
             }
+            ds4_gpu_selected_readback_summary_note_source(selected_id_source);
 
             if (selected_ids_available) {
                 for (uint32_t i = 0; i < n_expert; i++) {
