@@ -1,1 +1,1 @@
-We need to write the number forty-two in words. That is "forty
+The user asks me to write the number forty-two in words. This is a

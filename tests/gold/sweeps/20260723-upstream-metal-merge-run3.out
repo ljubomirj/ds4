@@ -1,0 +1,18 @@
+llama-benchy (0.3.7)
+Date: 2026-07-23 07:36:22
+Benchmarking model: deepseek-chat at http://127.0.0.1:8001/v1
+Concurrency levels: [1]
+Loading text from cache: /Users/ljubomir/.cache/llama-benchy/587e46ca21cd9eca14598069fe0629d6.txt
+Total tokens available in text corpus: 18717
+
+Skipping coherence test (--skip-coherence specified)
+Skipping latency measurement (assuming 0 ms).
+Running test: pp=2048, tg=128, depth=1024, concurrency=1
+  Run 1/1 (batch size 1)...
+  No token_ids in response, using local tokenization
+Saving results to tests/gold/sweeps/20260723-upstream-metal-merge-run3.md in MD format...
+
+
+
+llama-benchy (0.3.7)
+date: 2026-07-23 07:36:22 | latency mode: none

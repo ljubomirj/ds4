@@ -4,6 +4,10 @@
 # Compares current generation output against recorded golden fixtures.
 # All tests are deterministic (temp=0, fixed seed).
 #
+# Fixture recorded 2026-08-11 on reap-compact-speed @ b9baf46 (01bdc35 base)
+# with the 0731 model (DeepSeek-V4-Flash-0731-REAP25-IQ2XXS-w2Q2K-AProjQ8-
+# SExpQ8-OutQ8-imatrix.gguf). The pre-0731 LCB50 fixture is superseded.
+#
 # Usage: ./tests/gold/run_test.sh
 #   Returns 0 on pass, 1 on failure, prints details.
 
@@ -12,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GOLD_DIR="$SCRIPT_DIR"
 
-MODEL="$HOME/ds4/gguf/DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf"
+MODEL="$HOME/ds4/gguf/DeepSeek-V4-Flash-0731-REAP25-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf"
 BINARY="$SCRIPT_DIR/../../ds4"
 PROMPT_FILE="$GOLD_DIR/prompt.txt"
 GOLD_TEXT="$GOLD_DIR/expected_output.txt"
