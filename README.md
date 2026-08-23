@@ -2,10 +2,13 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-> **Fork of [antirez/ds4](https://github.com/antirez/ds4)** — additional branches:
-> [`l26f`](https://github.com/ljubomirj/ds4/tree/l26f) (Ling-2.6-Flash),
-> [`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support) (REAP-compact GGUF)
+**Fork of [antirez/ds4](https://github.com/antirez/ds4)** — additional branches:
+[`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support) (REAP-compact GGUF),
+[`reap-compact-speed`](https://github.com/ljubomirj/ds4/tree/reap-compact-speed) (REAP-compact GGUF speedup WIP),
+[`l26f`](https://github.com/ljubomirj/ds4/tree/l26f) (Ling-2.6-Flash),
+[`l30f`](https://github.com/ljubomirj/ds4/tree/l30f) (Ling-3.0-Flash)
 
+# DwarfStar
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
 machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
@@ -64,6 +67,15 @@ notice in our `LICENSE` file.
 The software is currently very fast changing. Consider it beta quality.
 Before each release, a big QA run is executed, however instabilities
 are definitely possible.
+
+# How to use this project?
+
+I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
+
+1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
+2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+
+So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
 
 ## More Documentation
 
