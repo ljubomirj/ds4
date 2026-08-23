@@ -328,8 +328,13 @@ This provides 1M token context for extended agent sessions with REAP memory effi
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-# DwarfStar
+**Fork of [antirez/ds4](https://github.com/antirez/ds4)** — additional branches:
+[`reap-compact-support`](https://github.com/ljubomirj/ds4/tree/reap-compact-support) (REAP-compact GGUF),
+[`reap-compact-speed`](https://github.com/ljubomirj/ds4/tree/reap-compact-speed) (REAP-compact GGUF speedup WIP),
+[`l26f`](https://github.com/ljubomirj/ds4/tree/l26f) (Ling-2.6-Flash),
+[`l30f`](https://github.com/ljubomirj/ds4/tree/l30f) (Ling-3.0-Flash)
 
+# DwarfStar
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
 machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,

@@ -22615,6 +22615,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                       layer->attn_q_a_norm->abs_offset,
                                                       (uint32_t)q_rank, DS4_RMS_EPS) != 0;
     }
+    DS4_METAL_PROFILE_DECODE_STAGE("q_a_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora_norm", metal_graph_qr_norm(g), q_rank, il, pos);
     }
@@ -22641,6 +22642,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                     (uint64_t)tp_heads * DS4_N_HEAD_DIM,
                                                     metal_graph_qr_norm(g),
                                                     1);
+    DS4_METAL_PROFILE_DECODE_STAGE("q_b_mat");
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", metal_graph_q(g), q_dim, il, pos);
     }
