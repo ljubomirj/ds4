@@ -4835,19 +4835,30 @@ kernel void kernel_dsv4_router_finalize_weights_one_simd(
         device float *weights,
         threadgroup float *scratch [[threadgroup(0)]],
         uint tid [[thread_position_in_threadgroup]]) {
-    if (tid >= 256 || args.hash_mode) return;
+    if (tid >= 256) return;
 
-    (void)hash;
-    (void)tokens;
     threadgroup float *score0_tg = scratch;
     threadgroup int32_t *idx0_tg =
         (threadgroup int32_t *)(scratch + 256);
     threadgroup float *score1_tg = scratch + 512;
     threadgroup int32_t *idx1_tg =
         (threadgroup int32_t *)(scratch + 768);
-    const float p = probs[tid];
-    float score = args.has_bias ? p + bias[tid] : p;
+    float score = args.has_bias ? probs[tid] + bias[tid] : probs[tid];
     int32_t idx = (int32_t)tid;
+
+    if (args.hash_mode) {
+        /* Hash-routed layers skip the bitonic selection entirely: the
+         * selected ids come straight from the per-token hash row, and the
+         * weight normalization below is identical to the top-k path. */
+        const uint token = args.use_token_buffer ? (uint)tokens[0] : args.token;
+        const uint row = min(token, args.hash_rows - 1u);
+        idx = (int32_t)tid;
+        if (tid < 6) {
+            idx = hash[row * 6u + tid];
+        }
+        score = tid < 6 ? probs[idx] : score;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
     uint cross_stage = 0;
 
     for (uint k = 2; k <= 256; k <<= 1) {
@@ -4890,6 +4901,7 @@ kernel void kernel_dsv4_router_finalize_weights_one_simd(
                 cross_stage++;
             }
         }
+    }
     }
 
     if (tid < 6) {

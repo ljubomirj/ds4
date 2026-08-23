@@ -23928,7 +23928,7 @@ static bool metal_graph_encode_decode_layer_phase(
             g->shared_gate_up_swiglu_fuse &&
             layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
             layer->ffn_gate_inp->dim[0] == DS4_N_EMBD &&
-            layer->ffn_gate_inp->dim[1] == DS4_N_EXPERT &&
+            layer->ffn_gate_inp->dim[1] == reap_layer_expert_count(il) &&
             (!ds4_gpu_device_is_pre_m5_apple_silicon() ||
              getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_SHARED_FUSE") == NULL) &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
@@ -23973,7 +23973,7 @@ static bool metal_graph_encode_decode_layer_phase(
                             layer->ffn_gate_shexp->abs_offset,
                             layer->ffn_up_shexp->abs_offset,
                             DS4_N_EMBD,
-                            DS4_N_EXPERT,
+                            reap_layer_expert_count(il),
                             shared_dim,
                             metal_graph_ffn_norm(g),
                             DS4_SWIGLU_CLAMP_EXP,

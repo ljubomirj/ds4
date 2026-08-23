@@ -3480,7 +3480,11 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !ds4_gpu_device_name_contains("M3") &&
+        !ds4_gpu_device_name_contains("M5")) return 0;
+    if (ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        getenv("DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE") != NULL) return 0;
     return 1;
 }
 
@@ -24529,8 +24533,35 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                     .nb1 = (uint64_t)rank * sizeof(float),
                     .nr0 = 2,
                 };
-                id<MTLComputePipelineState> pipeline =
-                    ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                /* The one-token Flash decode shape is invariant: eight
+                 * independent 4096 -> 1024 Q8_0 projections.  The static-trip
+                 * PSO keeps the generic NR0=2 / NSG=4 arithmetic and reduction
+                 * tree; only group offsets and loop bounds become literals.
+                 * Fall back to the generic kernel when the exact shape or the
+                 * optional kernel is unavailable. */
+                const bool use_flash_decode_static =
+                    n_tokens == 1u &&
+                    group_dim == 4096u && rank == 1024u &&
+                    n_groups == 8u && low_dim == 8192u &&
+                    row_a_bytes == 4352u && out_a_bytes == 35651584u &&
+                    getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_Q8_STATIC") == NULL;
+                id<MTLComputePipelineState> pipeline = use_flash_decode_static
+                    ? ds4_gpu_get_mul_mv_pipeline(
+                          "kernel_dsv4_attn_out_low_q8_0_flash_decode_static_f32", 4)
+                    : nil;
+                if (use_flash_decode_static && pipeline == nil) {
+                    static bool static_kernel_missing = false;
+                    if (!static_kernel_missing) {
+                        fprintf(stderr,
+                                "ds4: static attn-out-low kernel unavailable; "
+                                "using generic\n");
+                    }
+                    static_kernel_missing = true;
+                }
+                if (pipeline == nil) {
+                    pipeline = ds4_gpu_get_mul_mv_pipeline(
+                        "kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                }
                 ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                              pipeline,
                                                              &args,
@@ -31973,7 +32004,7 @@ static int ds4_gpu_encode_router_select(
             (!pre_m5_device ||
              getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_SIMD_FINALIZE") == NULL);
         const bool use_simd_weights_fusion =
-            use_simd_finalize &&
+            (use_simd_finalize || hash_mode) &&
             g_dsv4_router_finalize_weights_one_simd_pipeline != nil &&
             g_dsv4_router_finalize_weights_one_simd_pipeline.threadExecutionWidth == 32u &&
             g_dsv4_router_finalize_weights_one_simd_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
